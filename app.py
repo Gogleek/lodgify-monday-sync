@@ -34,7 +34,7 @@ def normalize_phone(raw: str) -> str:
 
 # Logical key → Monday column_id mapping (დაარეგულირე შენს ბორდზე)
 COLUMN_MAP = {
-    "reservation_id": "reservation_id",   # Text column (lookup)
+    "reservation_id": "reservation_id",  # Text column (lookup)
     "unit": "text_unit",
     "email": "email",
     "phone": "phone",
@@ -42,14 +42,14 @@ COLUMN_MAP = {
     "check_out": "check_out",
     "total": "total",
     "currency": "currency",
-    "status": "status_dropdown",          # Dropdown
-    "assignee": "assignee",               # People
+    "status": "status_dropdown",         # Dropdown
+    "assignee": "assignee",              # People
 }
 
 DROPDOWN_LABELS = {
     "status": {
         "confirmed": "Confirmed",
-        "booked": "Confirmed",        # Lodgify v2 "Booked"
+        "booked": "Confirmed",           # Lodgify v2 "Booked"
         "paid": "Paid",
         "pending": "Pending",
         "cancelled": "Cancelled",
@@ -254,6 +254,7 @@ def map_booking_to_monday(bk: dict) -> dict:
     check_out = to_date(check_out_raw)
 
     total_price = bk.get("total_amount") or bk.get("total") or bk.get("price_total") or 0
+    # ყურადღება: თუ ვალუტა არ მოიძებნა, ნაგულისხმევად იქნება "GBP". საჭიროების შემთხვევაში შეცვალეთ.
     currency = bk.get("currency_code") or bk.get("currency") or "GBP"
 
     display_name = (f"{first_name} {last_name}".strip() or full_name) or f"Booking {res_id}"
@@ -269,8 +270,14 @@ def map_booking_to_monday(bk: dict) -> dict:
     put(cv, "currency", currency)
     put(cv, "status", {"labels": [status_label]})
 
-    if email:
-        cv[COLUMN_MAP["assignee"]] = {"personsAndTeams": [{"id": email, "kind": "person"}]}
+    # --- [შესწორება] ---
+    # ქვემოთ მოცემული ლოგიკა იწვევდა შეცდომას, რადგან Monday.com-ის "People" სვეტი
+    # `id`-ში ელოდება მომხმარებლის ციფრულ ID-ს და არა ელფოსტას.
+    # ამ ფუნქციონალის სწორად ასამუშავებლად საჭიროა დამატებითი ლოგიკა,
+    # რომელიც ელფოსტით მოძებნის მომხმარებლის ID-ს Monday-ს ბაზაში.
+    #
+    # if email:
+    #     cv[COLUMN_MAP["assignee"]] = {"personsAndTeams": [{"id": email, "kind": "person"}]}
 
     return {"item_name": display_name, "external_id": res_id, "column_values": cv}
 
@@ -281,7 +288,15 @@ LODGY_API_BASE = os.getenv("LODGY_API_BASE", "https://api.lodgify.com")
 LODGY_API_KEY  = os.getenv("LODGY_API_KEY", "")
 MONDAY_API_BASE = os.getenv("MONDAY_API_BASE", "https://api.monday.com/v2")
 MONDAY_API_KEY  = os.getenv("MONDAY_API_KEY", "")
-MONDAY_BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "0"))
+
+# --- [შესწორება] ---
+# დავამატეთ try-except ბლოკი, რათა აპლიკაცია არ გაითიშოს,
+# თუ MONDAY_BOARD_ID ცვლადი არასწორად არის მითითებული.
+try:
+    MONDAY_BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "0"))
+except (ValueError, TypeError):
+    log.error("MONDAY_BOARD_ID გარემოს ცვლადი არასწორია. გამოყენებულია ნაგულისხმევი ID: 0")
+    MONDAY_BOARD_ID = 0
 
 lodgify = LodgifyClient(api_base=LODGY_API_BASE, api_key=LODGY_API_KEY)
 monday  = MondayClient(api_base=MONDAY_API_BASE, api_key=MONDAY_API_KEY, board_id=MONDAY_BOARD_ID)
@@ -334,23 +349,6 @@ def lodgify_sync_all():
     except Exception as e:
         log.exception("Batch sync failed")
         return jsonify({"ok": False, "error": str(e)}), 500
-
-# (სურვილისამებრ) დიაგნოსტიკისთვის გააქტიურე:
-# @app.get("/diag/monday")
-# def diag_monday():
-#     try:
-#         data = monday._gql("query { me { id name } }")
-#         return jsonify({"ok": True, "me": data.get("me")}), 200
-#     except Exception as e:
-#         return jsonify({"ok": False, "error": str(e)}), 500
-#
-# @app.get("/diag/lodgify")
-# def diag_lodgify():
-#     try:
-#         items = lodgify.list_bookings(limit=1, skip=0)
-#         return jsonify({"ok": True, "count": len(items), "sample": items[:1]}), 200
-#     except Exception as e:
-#         return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
