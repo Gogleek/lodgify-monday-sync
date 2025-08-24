@@ -49,6 +49,7 @@ COLUMN_MAP = {
 DROPDOWN_LABELS = {
     "status": {
         "confirmed": "Confirmed",
+        "booked": "Confirmed",        # Lodgify v2 "Booked"
         "paid": "Paid",
         "pending": "Pending",
         "cancelled": "Cancelled",
@@ -60,6 +61,12 @@ DROPDOWN_LABELS = {
 def to_date(v):
     if not v:
         return None
+    # allow dicts like {"time": null, ...}
+    if isinstance(v, dict):
+        # best-effort: try v.get("time") or return None
+        v = v.get("time") or None
+        if not v:
+            return None
     try:
         return datetime.fromisoformat(str(v).replace("Z", "+00:00")).date().isoformat()
     except Exception:
@@ -70,7 +77,7 @@ def to_date(v):
 
 def put(cv: dict, logical_key: str, value):
     col_id = COLUMN_MAP.get(logical_key)
-    if col_id:
+    if col_id is not None and value is not None:
         cv[col_id] = value
 
 # -----------------------
@@ -89,24 +96,28 @@ class LodgifyClient:
         })
 
     def list_bookings(self, limit: int = 50, skip: int = 0) -> List[dict]:
-        # v2 list endpoint
         url = f"{self.api_base}/v2/reservations/bookings"
-        # ზოგ ანგარიშზე pagination-ის საკვანძოები შეიძლება განსხვავდებოდეს; დავტოვე ყველაზე უსაფრთხო ვარიანტად უბრალო მიღება
-        # თუ გჭირდება ზუსტი პეგინაცია, შეგვეძლება params შეცვლა take/skip-ზე ან page/size-ზე.
-        params = {}
-        resp = self.session.get(url, params=params, timeout=30)
+        # სცენარი A: take/skip
+        params = {"take": max(1, int(limit)), "skip": max(0, int(skip))}
+        resp = self.session.get(url, params=params, timeout=45)
+
+        # fallback სცენარი: page/pageSize
+        if resp.status_code in (400, 404):
+            page_size = max(1, int(limit))
+            page_number = max(1, (int(skip) // page_size) + 1)
+            params = {"pageSize": page_size, "pageNumber": page_number}
+            resp = self.session.get(url, params=params, timeout=45)
+
         if not resp.ok:
             raise RuntimeError(f"Lodgify error {resp.status_code}: {resp.text[:500]}")
+
         data = resp.json() or {}
-        # Normalize common wrappers
         items = data.get("results") or data.get("items") or data.get("data") or data
         if isinstance(items, dict):
             items = list(items.values())
         if not isinstance(items, list):
             items = []
-        # ლოკალურად დავასლაისოთ საჭირო რაოდენობა
-        items = items[skip:skip+limit] if limit else items
-        log.info("Lodgify v2 fetched %d item(s)", len(items))
+        log.info("Lodgify v2 fetched %d item(s) (limit=%s, skip=%s)", len(items), limit, skip)
         return items
 
 # -----------------------
@@ -153,8 +164,9 @@ class MondayClient:
         return out.get("data", {})
 
     def find_item_by_external_id(self, column_id: str, external_id: str) -> Optional[int]:
+        # ID! ტიპებზე გადავიყვანეთ
         query = """
-        query($board_id: Int!, $column_id: String!, $value: String!) {
+        query($board_id: ID!, $column_id: String!, $value: String!) {
           items_page_by_column_values(
             board_id: $board_id,
             columns: [{column_id: $column_id, column_values: [$value]}],
@@ -162,26 +174,26 @@ class MondayClient:
           ) { items { id } }
         }
         """
-        data = self._gql(query, {"board_id": self.board_id, "column_id": column_id, "value": external_id})
+        data = self._gql(query, {"board_id": str(self.board_id), "column_id": column_id, "value": external_id})
         items = (((data or {}).get("items_page_by_column_values") or {}).get("items")) or []
         return int(items[0]["id"]) if items else None
 
     def create_item(self, item_name: str, column_values: Dict[str, object]) -> int:
         query = """
-        mutation($board_id: Int!, $name: String!, $cols: JSON!) {
+        mutation($board_id: ID!, $name: String!, $cols: JSON!) {
           create_item(board_id: $board_id, item_name: $name, column_values: $cols) { id }
         }
         """
-        data = self._gql(query, {"board_id": self.board_id, "name": item_name, "cols": json.dumps(column_values)})
+        data = self._gql(query, {"board_id": str(self.board_id), "name": item_name, "cols": json.dumps(column_values)})
         return int(data["create_item"]["id"])
 
     def update_item(self, item_id: int, column_values: Dict[str, object]) -> int:
         query = """
-        mutation($item_id: Int!, $cols: JSON!) {
+        mutation($item_id: ID!, $cols: JSON!) {
           change_multiple_column_values(item_id: $item_id, column_values: $cols) { id }
         }
         """
-        data = self._gql(query, {"item_id": item_id, "cols": json.dumps(column_values)})
+        data = self._gql(query, {"item_id": str(item_id), "cols": json.dumps(column_values)})
         return int(data["change_multiple_column_values"]["id"])
 
     def upsert_item(self, mapped: dict) -> UpsertResult:
@@ -208,11 +220,23 @@ class MondayClient:
 # Mapping
 # -----------------------
 def map_booking_to_monday(bk: dict) -> dict:
+    # Lodgify v2 sample keys: guest.name, arrival, departure, currency_code, total_amount
     guest = bk.get("guest") or {}
+    # name შეიძლება იყოს "First Last"
+    full_name = (guest.get("name") or "").strip()
+    first_name = (guest.get("first_name") or "").strip()
+    last_name = (guest.get("last_name") or "").strip()
+    if not (first_name or last_name):
+        # სცადე full_name-ის გაყოფა
+        if full_name:
+            parts = full_name.split()
+            if len(parts) == 1:
+                first_name = parts[0]
+            else:
+                first_name = " ".join(parts[:-1])
+                last_name = parts[-1]
     phone = normalize_phone(guest.get("phone") or guest.get("mobile") or "")
     email = guest.get("email") or ""
-    first_name = guest.get("first_name") or guest.get("name") or ""
-    last_name = guest.get("last_name") or ""
 
     res_id = str(bk.get("id") or bk.get("booking_id") or bk.get("code") or "")
     unit_name = (bk.get("rental") or {}).get("name") or bk.get("unit_name") or "Unknown unit"
@@ -223,20 +247,24 @@ def map_booking_to_monday(bk: dict) -> dict:
         DROPDOWN_LABELS["status"].get("default", "Pending")
     )
 
-    check_in = bk.get("check_in") or bk.get("start_date")
-    check_out = bk.get("check_out") or bk.get("end_date")
-    total_price = bk.get("total") or bk.get("price_total") or 0
-    currency = bk.get("currency") or "GBP"
+    # Prefer v2 fields
+    check_in_raw = bk.get("arrival") or bk.get("check_in")
+    check_out_raw = bk.get("departure") or bk.get("check_out")
+    check_in = to_date(check_in_raw)
+    check_out = to_date(check_out_raw)
 
-    item_name = f"{first_name} {last_name}".strip() or f"Booking {res_id}"
+    total_price = bk.get("total_amount") or bk.get("total") or bk.get("price_total") or 0
+    currency = bk.get("currency_code") or bk.get("currency") or "GBP"
+
+    display_name = (f"{first_name} {last_name}".strip() or full_name) or f"Booking {res_id}"
 
     cv = {}
     put(cv, "reservation_id", res_id)
     put(cv, "unit", unit_name)
     put(cv, "email", email)
     put(cv, "phone", phone)
-    put(cv, "check_in", {"date": to_date(check_in)})
-    put(cv, "check_out", {"date": to_date(check_out)})
+    put(cv, "check_in", {"date": check_in})
+    put(cv, "check_out", {"date": check_out})
     put(cv, "total", total_price)
     put(cv, "currency", currency)
     put(cv, "status", {"labels": [status_label]})
@@ -244,12 +272,12 @@ def map_booking_to_monday(bk: dict) -> dict:
     if email:
         cv[COLUMN_MAP["assignee"]] = {"personsAndTeams": [{"id": email, "kind": "person"}]}
 
-    return {"item_name": item_name, "external_id": res_id, "column_values": cv}
+    return {"item_name": display_name, "external_id": res_id, "column_values": cv}
 
 # -----------------------
 # Flask endpoints
 # -----------------------
-LODGY_API_BASE = os.getenv("LODGY_API_BASE", "https://api.lodgify.com")   # Base-ზე აღარ წერია /api
+LODGY_API_BASE = os.getenv("LODGY_API_BASE", "https://api.lodgify.com")
 LODGY_API_KEY  = os.getenv("LODGY_API_KEY", "")
 MONDAY_API_BASE = os.getenv("MONDAY_API_BASE", "https://api.monday.com/v2")
 MONDAY_API_KEY  = os.getenv("MONDAY_API_KEY", "")
@@ -307,7 +335,7 @@ def lodgify_sync_all():
         log.exception("Batch sync failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# სურვილისამებრ დიაგნოსტიკისთვის — გააქტიურე თუ დაგჭირდება:
+# (სურვილისამებრ) დიაგნოსტიკისთვის გააქტიურე:
 # @app.get("/diag/monday")
 # def diag_monday():
 #     try:
