@@ -78,18 +78,19 @@ def ensure_columns_and_get_map():
     if COLUMN_ID_MAP:
         return COLUMN_ID_MAP
 
+    # ColumnType enum MUST be uppercase
     required = [
-        {"key": "booking_id", "title": "Booking ID", "type": "text"},
-        {"key": "guest",      "title": "Guest",      "type": "text"},
-        {"key": "email",      "title": "Email",      "type": "email"},
-        {"key": "check_in",   "title": "Check in",   "type": "date"},
-        {"key": "check_out",  "title": "Check out",  "type": "date"},
-        {"key": "property",   "title": "Property",   "type": "text"},
+        {"key": "booking_id", "title": "Booking ID", "type": "TEXT"},
+        {"key": "guest",      "title": "Guest",      "type": "TEXT"},
+        {"key": "email",      "title": "Email",      "type": "EMAIL"},
+        {"key": "check_in",   "title": "Check in",   "type": "DATE"},
+        {"key": "check_out",  "title": "Check out",  "type": "DATE"},
+        {"key": "property",   "title": "Property",   "type": "TEXT"},
     ]
 
     cols = get_board_columns()
 
-    def find_col_id_by_title_or_id(wanted_title):
+    def find_col_id_by_title(wanted_title):
         low = wanted_title.strip().lower()
         for c in cols:
             if (c.get("title") or "").strip().lower() == low:
@@ -98,7 +99,7 @@ def ensure_columns_and_get_map():
 
     id_map = {}
     for r in required:
-        cid = find_col_id_by_title_or_id(r["title"])
+        cid = find_col_id_by_title(r["title"])
         if cid:
             id_map[r["key"]] = cid
             continue
@@ -108,7 +109,6 @@ def ensure_columns_and_get_map():
           create_column(board_id: $board, title: $title, column_type: $ctype) { id }
         }
         """
-        # Monday GraphQL enums as variables: passing lower-case strings works in practice
         resp = monday_graphql(create_q, {"board": BOARD_ID, "title": r["title"], "ctype": r["type"]})
         try:
             new_id = resp["data"]["create_column"]["id"]
@@ -116,7 +116,7 @@ def ensure_columns_and_get_map():
             cols.append({"id": new_id, "title": r["title"], "type": r["type"]})
         except Exception:
             app.logger.error(f"Failed to create column '{r['title']}' ({r['type']}), resp={resp}")
-            id_map[r["key"]] = r["title"]  # fallback, but likely to fail on mutation
+            id_map[r["key"]] = r["title"]  # fallback (mutation შესაძლოა ჩავარდეს)
 
     COLUMN_ID_MAP = id_map
     app.logger.info(f"Column map: {COLUMN_ID_MAP}")
@@ -151,10 +151,9 @@ def find_item_by_booking_id(booking_id: str):
 
 def build_column_values(fields: dict):
     """
-    IMPORTANT:
-    - text columns => value is a plain string
-    - email column => {"email": "...", "text": "..."}
-    - date column  => {"date": "YYYY-MM-DD"}
+    - TEXT  => plain string
+    - EMAIL => {"email": "...", "text": "..."}
+    - DATE  => {"date": "YYYY-MM-DD"}
     """
     cmap = ensure_columns_and_get_map()
     colvals = {}
@@ -162,7 +161,7 @@ def build_column_values(fields: dict):
     def set_text(key, val):
         v = (val or "").strip()
         if v:
-            colvals[cmap[key]] = v  # <-- plain string for text columns
+            colvals[cmap[key]] = v  # IMPORTANT: plain string
 
     def set_date(key, val):
         v = (val or "").strip()
@@ -183,13 +182,26 @@ def build_column_values(fields: dict):
 
     return colvals
 
+def sanitize_text_objects(colvals: dict):
+    """
+    Safety net: თუ შემთხვევით შემორჩა {"text": "..."} — გადააკეთე "..."-ად.
+    """
+    fixed = {}
+    for k, v in colvals.items():
+        if isinstance(v, dict) and set(v.keys()) == {"text"}:
+            fixed[k] = v["text"]
+        else:
+            fixed[k] = v
+    return fixed
+
 def upsert_to_monday(fields: dict):
     booking_id = fields.get("booking_id") or ""
     if not booking_id:
         return {"errors": [{"message": "missing booking_id"}]}
 
     item_id = find_item_by_booking_id(booking_id)
-    colvals = build_column_values(fields)
+    colvals = sanitize_text_objects(build_column_values(fields))
+    colvals_json = json.dumps(colvals)
 
     if item_id:
         q = """
@@ -197,7 +209,7 @@ def upsert_to_monday(fields: dict):
           change_multiple_column_values(item_id: $item, board_id: $board, column_values: $vals) { id }
         }
         """
-        return monday_graphql(q, {"item": item_id, "board": BOARD_ID, "vals": json.dumps(colvals)})
+        return monday_graphql(q, {"item": item_id, "board": BOARD_ID, "vals": colvals_json})
 
     q = """
     mutation($board: ID!, $name: String!, $vals: JSON!) {
@@ -205,7 +217,7 @@ def upsert_to_monday(fields: dict):
     }
     """
     name = f"Booking {booking_id}"
-    return monday_graphql(q, {"board": BOARD_ID, "name": name, "vals": json.dumps(colvals)})
+    return monday_graphql(q, {"board": BOARD_ID, "name": name, "vals": colvals_json})
 
 # ---------- Routes ----------
 @app.route("/")
