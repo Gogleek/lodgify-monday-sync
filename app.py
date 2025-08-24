@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+from time import monotonic
 
 # -----------------------
 # App / Logging
@@ -130,7 +131,7 @@ STATUS_LABELS = {
 }
 STATUS_DEFAULT = "Pending"
 
-# NOTE: ბორდზე რეალურად არსებული labels – Manual/Direct ამოღებულია, რომ ერორი აღარ მივიღოთ
+# NOTE: რეალურად არსებული labels – Manual/Direct ამოღებულია
 SOURCE_LABELS = {
     "booking.com": "Booking.com",
     "airbnb": "Airbnb",
@@ -372,7 +373,6 @@ def map_booking_to_monday(bk: dict) -> dict:
 
     # >>> FIX: Email ფორმატი სწორია; ცარიელზე საერთოდ არ ვწერთ
     email_val = (guest.get("email") or "").strip()
-
     phone = normalize_phone(guest.get("phone") or guest.get("mobile") or "")
 
     # dates
@@ -489,7 +489,11 @@ monday  = MondayClient(api_base=MONDAY_API_BASE, api_key=MONDAY_API_KEY, board_i
 @app.errorhandler(Exception)
 def _unhandled(e):
     log.exception("Unhandled error")
-    return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({
+        "ok": False,
+        "error": str(e.__class__.__name__),
+        "message": str(e)
+    }), 500
 
 @app.get("/health")
 def health():
@@ -570,15 +574,39 @@ def lodgify_sync_all():
     limit = max(1, min(200, int(request.args.get("limit", 50))))
     skip = max(0, int(request.args.get("skip", 0)))
     debug = request.args.get("debug", "0") == "1"
+    max_sec = int(request.args.get("max_sec", "25"))  # რბილი შეზღუდვა
 
     if MONDAY_BOARD_ID <= 0:
         return jsonify({"ok": False, "error": "Invalid MONDAY_BOARD_ID"}), 400
     if not LODGY_API_KEY or not MONDAY_API_KEY:
         return jsonify({"ok": False, "error": "Missing API keys"}), 400
 
-    bookings = lodgify.list_bookings(limit=limit, skip=skip)
+    try:
+        bookings = lodgify.list_bookings(limit=limit, skip=skip)
+    except Exception as e:
+        log.exception("Lodgify fetch failed")
+        return jsonify({
+            "ok": False,
+            "error": f"Lodgify fetch failed: {str(e)}",
+            "hint": "Check LODGY_API_KEY / connectivity / reduce limit"
+        }), 502
+
+    # Lodgify ზოგჯერ მაინც აბრუნებს 25-ს → ვჭრით
+    bookings = list(bookings)[:limit]
+
     results = []
+    processed = 0
+    start = monotonic()
+
     for bk in bookings:
+        if monotonic() - start > max_sec:
+            results.append({
+                "ok": False,
+                "error": "soft timeout hit",
+                "hint": "increase max_sec or use smaller limit"
+            })
+            break
+
         try:
             mapped = map_booking_to_monday(bk)
             res: UpsertResult = monday.upsert_item(mapped)
@@ -586,15 +614,27 @@ def lodgify_sync_all():
         except Exception as e:
             log.exception("Upsert failed for booking id=%s", bk.get("id"))
             results.append({"ok": False, "error": str(e), "source_id": bk.get("id")})
+        processed += 1
 
-    resp = {"ok": True, "count": len(results), "results": results}
+    resp = {
+        "ok": True,
+        "count": len(results),
+        "processed": processed,
+        "next_skip": skip + processed,
+        "results": results
+    }
     if debug and bookings:
         try:
             resp["sample_input"] = bookings[:1]
             resp["sample_mapped"] = map_booking_to_monday(bookings[0])
         except Exception:
             pass
+
     return jsonify(resp), 200
+
+@app.get("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
