@@ -32,7 +32,7 @@ def normalize_phone(raw: str) -> str:
     digits = re.sub(r"\D", "", s)
     return digits[-12:] if digits else ""
 
-# Logical key → Monday column_id mapping (გაასწორე შენი ბორდის column_id-ებზე)
+# Logical key → Monday column_id mapping (დაარეგულირე შენს ბორდზე)
 COLUMN_MAP = {
     "reservation_id": "reservation_id",   # Text column (lookup)
     "unit": "text_unit",
@@ -74,30 +74,39 @@ def put(cv: dict, logical_key: str, value):
         cv[col_id] = value
 
 # -----------------------
-# Lodgify Client
+# Lodgify Client (v2)
 # -----------------------
 class LodgifyClient:
     def __init__(self, api_base: str, api_key: str):
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.session = requests.Session()
+        # ვხმარობთ X-ApiKey ჰედერს (არა Bearer-ს)
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
+            "X-ApiKey": self.api_key,
         })
 
     def list_bookings(self, limit: int = 50, skip: int = 0) -> List[dict]:
-        url = f"{self.api_base}/v1/bookings"
-        params = {"limit": limit, "skip": skip}
+        # v2 list endpoint
+        url = f"{self.api_base}/v2/reservations/bookings"
+        # ზოგ ანგარიშზე pagination-ის საკვანძოები შეიძლება განსხვავდებოდეს; დავტოვე ყველაზე უსაფრთხო ვარიანტად უბრალო მიღება
+        # თუ გჭირდება ზუსტი პეგინაცია, შეგვეძლება params შეცვლა take/skip-ზე ან page/size-ზე.
+        params = {}
         resp = self.session.get(url, params=params, timeout=30)
         if not resp.ok:
             raise RuntimeError(f"Lodgify error {resp.status_code}: {resp.text[:500]}")
         data = resp.json() or {}
-        items = data.get("results") or data.get("items") or data.get("data") or data or []
+        # Normalize common wrappers
+        items = data.get("results") or data.get("items") or data.get("data") or data
         if isinstance(items, dict):
             items = list(items.values())
-        log.debug("Lodgify fetched %d items", len(items))
+        if not isinstance(items, list):
+            items = []
+        # ლოკალურად დავასლაისოთ საჭირო რაოდენობა
+        items = items[skip:skip+limit] if limit else items
+        log.info("Lodgify v2 fetched %d item(s)", len(items))
         return items
 
 # -----------------------
@@ -127,7 +136,7 @@ class MondayClient:
         self.board_id = board_id
         self.session = requests.Session()
         self.session.headers.update({
-            "Authorization": self.api_key,
+            "Authorization": self.api_key,  # პირდაპირი ტოკენი (არა 'Bearer ...')
             "Content-Type": "application/json",
         })
 
@@ -180,7 +189,7 @@ class MondayClient:
         external_id = mapped["external_id"]
         column_values = mapped["column_values"]
 
-        lookup_col = COLUMN_MAP["reservation_id"]  # must exist on your board
+        lookup_col = COLUMN_MAP["reservation_id"]  # აუცილებელია ეს სვეტი არსებობდეს ბორდზე
         try:
             existing_id = self.find_item_by_external_id(lookup_col, external_id)
             if existing_id:
@@ -240,7 +249,7 @@ def map_booking_to_monday(bk: dict) -> dict:
 # -----------------------
 # Flask endpoints
 # -----------------------
-LODGY_API_BASE = os.getenv("LODGY_API_BASE", "https://api.lodgify.com")
+LODGY_API_BASE = os.getenv("LODGY_API_BASE", "https://api.lodgify.com")   # Base-ზე აღარ წერია /api
 LODGY_API_KEY  = os.getenv("LODGY_API_KEY", "")
 MONDAY_API_BASE = os.getenv("MONDAY_API_BASE", "https://api.monday.com/v2")
 MONDAY_API_KEY  = os.getenv("MONDAY_API_KEY", "")
@@ -297,6 +306,23 @@ def lodgify_sync_all():
     except Exception as e:
         log.exception("Batch sync failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# სურვილისამებრ დიაგნოსტიკისთვის — გააქტიურე თუ დაგჭირდება:
+# @app.get("/diag/monday")
+# def diag_monday():
+#     try:
+#         data = monday._gql("query { me { id name } }")
+#         return jsonify({"ok": True, "me": data.get("me")}), 200
+#     except Exception as e:
+#         return jsonify({"ok": False, "error": str(e)}), 500
+#
+# @app.get("/diag/lodgify")
+# def diag_lodgify():
+#     try:
+#         items = lodgify.list_bookings(limit=1, skip=0)
+#         return jsonify({"ok": True, "count": len(items), "sample": items[:1]}), 200
+#     except Exception as e:
+#         return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
