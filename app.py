@@ -139,6 +139,20 @@ def _extract_unit_and_property(bk: dict) -> Tuple[Optional[str], Optional[str]]:
 
     return (unit_name, prop_id)
 
+def guess_unit_from_source_text(txt: Optional[str]) -> Optional[str]:
+    if not txt:
+        return None
+    s = str(txt).strip()
+    # ბოლოდანის ფრჩხილები: (...Queens 8)
+    m = re.search(r"\(([^)]+)\)\s*$", s)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    # ბოლო " - " სეგმენტი
+    parts = [p.strip() for p in s.split(" - ") if p and p.strip()]
+    if len(parts) >= 2 and parts[-1]:
+        return parts[-1]
+    return None
+
 # -----------------------
 # COLUMN MAP ( შენი IDs )
 # -----------------------
@@ -185,7 +199,7 @@ STATUS_LABELS = {
 }
 STATUS_DEFAULT = "Pending"
 
-# რეალურად რაც გაქვს ბორდზე:
+# შენი ბორდის რეალური dropdown ლეიბლები:
 SOURCE_LABELS = {
     "booking.com": "Booking.com",
     "airbnb": "Airbnb",
@@ -405,9 +419,17 @@ def label_for_source(raw: Optional[str]) -> Optional[str]:
 def map_booking_to_monday(bk: dict) -> dict:
     res_id = str(bk.get("id") or bk.get("booking_id") or bk.get("code") or "").strip()
 
+    # unit/property
     unit_name, property_id = _extract_unit_and_property(bk)
+    # source_text გამოვიტანოთ აქვე, რათა იუნიტის fallback-ს ვიყენოთ
+    source_text  = bk.get("source_text") or ""
+    if not unit_name:
+        guessed = guess_unit_from_source_text(source_text)
+        if guessed:
+            unit_name = guessed
     unit_name = unit_name or "Unknown unit"
 
+    # guest
     guest = bk.get("guest") or {}
     full_name = (guest.get("name") or "").strip()
     first_name = (guest.get("first_name") or "").strip()
@@ -423,21 +445,24 @@ def map_booking_to_monday(bk: dict) -> dict:
     email_val = (guest.get("email") or "").strip()
     phone = normalize_phone(guest.get("phone") or guest.get("mobile") or "")
 
+    # dates
     check_in  = to_iso_date(bk.get("arrival")   or bk.get("check_in"))
     check_out = to_iso_date(bk.get("departure") or bk.get("check_out"))
     nights = days_between_iso(check_in, check_out)
 
+    # money
     total_amount = safe_float(bk.get("total_amount") or bk.get("total") or bk.get("price_total"))
     amount_paid  = safe_float(bk.get("amount_paid"))
     amount_due   = safe_float(bk.get("amount_due"))
     currency     = (bk.get("currency_code") or bk.get("currency") or "GBP").strip()
 
+    # status / source
     status_raw   = bk.get("status") or ""
     status_label = label_for_status(status_raw)
-    source_text  = bk.get("source_text") or ""
     source_raw   = (bk.get("source") or "") + (f" {source_text}" if source_text else "")
     source_label = label_for_source(source_raw)
 
+    # rooms / people
     people = None; adults = children = infants = pets = None; key_code = None
     rooms = bk.get("rooms") or []
     if rooms:
@@ -451,12 +476,14 @@ def map_booking_to_monday(bk: dict) -> dict:
             people = None
         key_code = r0.get("key_code") or ""
 
+    # misc
     language   = bk.get("language")
     thread_uid = bk.get("thread_uid")
     created_at  = to_iso_date(bk.get("created_at"))
     updated_at  = to_iso_date(bk.get("updated_at"))
     canceled_at = to_iso_date(bk.get("canceled_at"))
 
+    # build column_values
     cv = {}
     put(cv, "reservation_id", res_id or None)
     put(cv, "unit", unit_name)
