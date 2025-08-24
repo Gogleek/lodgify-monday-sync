@@ -1,10 +1,9 @@
 from flask import Flask, request, jsonify
 import requests, json, os, re
-from datetime import datetime as dt
 
 app = Flask(__name__)
 
-# --- ENV VARIABLES ---
+# --- ENVIRONMENT VARIABLES ---
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "2112686712"))
 LODGY_API_KEY = os.getenv("LODGY_API_KEY")
@@ -14,74 +13,13 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# ---------- Helpers (გადმოტანილია შენი მუშა კოდიდან) ----------
-def extract_date_string(value):
-    if isinstance(value, str):
-        s = value.strip()
-        if re.search(r"\d{4}-\d{2}-\d{2}", s):
-            return s
-        return s
-    if isinstance(value, dict):
-        for v in value.values():
-            s = extract_date_string(v)
-            if s:
-                return s
-    if isinstance(value, list):
-        for v in value:
-            s = extract_date_string(v)
-            if s:
-                return s
-    return ""
-
-def deep_find_preferred_date(obj, preferred_key_substrings):
-    results = []
-    def rec(o, path):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                kl = k.lower()
-                if any(sub in kl for sub in preferred_key_substrings):
-                    s = extract_date_string(v)
-                    if s:
-                        results.append(s)
-                rec(v, path+[k])
-        elif isinstance(o, list):
-            for v in o:
-                rec(v, path)
-    rec(obj, [])
-    return results[0] if results else ""
-
-def extract_guest_info(booking):
-    for key in ("guest","customer","contact","primaryGuest"):
-        if key in booking and isinstance(booking[key], dict):
-            g = booking[key]
-            return g.get("first_name") or "", g.get("last_name") or "", g.get("email") or ""
-    return "", "", ""
-
-def normalize_list(payload):
-    if isinstance(payload, list): return payload
-    if isinstance(payload, dict):
-        for k in ("items","bookings","results","data"):
-            v = payload.get(k)
-            if isinstance(v,list):
-                return v
-    return []
-
-# ---------- Lodgify wrappers ----------
+# --- Lodgify Helpers ---
 def fetch_properties():
     r = requests.get("https://api.lodgify.com/v1/properties", headers=HEADERS, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def fetch_bookings():
-    url = "https://api.lodgify.com/v2/reservations/bookings"
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    if r.status_code == 200:
-        return normalize_list(r.json())
-    else:
-        fb = requests.get("https://api.lodgify.com/v1/reservation", headers=HEADERS, timeout=30)
-        return normalize_list(fb.json()) if fb.status_code==200 else []
-
-# ---------- Monday wrappers ----------
+# --- Monday Helpers ---
 def find_existing_item(booking_id):
     query = """
     query ($board: Int!) {
@@ -98,24 +36,27 @@ def find_existing_item(booking_id):
       }
     }
     """
-    resp = requests.post("https://api.monday.com/v2",
+    resp = requests.post(
+        "https://api.monday.com/v2",
         headers={"Authorization": MONDAY_API_TOKEN, "Content-Type":"application/json"},
-        json={"query": query, "variables": {"board": BOARD_ID}})
+        json={"query": query, "variables": {"board": BOARD_ID}}
+    )
     try:
         items = resp.json()["data"]["boards"][0]["items_page"]["items"]
         for it in items:
             for col in it["column_values"]:
                 if col["id"]=="booking_id" and col["text"]==str(booking_id):
                     return it["id"]
-    except Exception: pass
+    except Exception:
+        pass
     return None
 
 def upsert_booking(b):
     bid = b.get("id") or b.get("bookingId")
-    g_first,g_last,email = extract_guest_info(b)
-    guest = f"{g_first} {g_last}".strip() or "N/A"
-    check_in = deep_find_preferred_date(b,["check_in","arrival","from","start"])
-    check_out= deep_find_preferred_date(b,["check_out","departure","to","end"])
+    guest = b.get("guest", {}).get("name", "N/A")
+    email = b.get("guest", {}).get("email", "")
+    check_in = b.get("check_in_date")
+    check_out= b.get("check_out_date")
     pname = b.get("property",{}).get("name") if isinstance(b.get("property"),dict) else "N/A"
 
     colvals = {
@@ -146,10 +87,15 @@ def upsert_booking(b):
         json={"query": mutation,"variables": variables})
     return r.json()
 
-# ---------- Flask Routes ----------
+# --- Routes ---
 @app.route("/")
 def home():
     return "Hello from Lodgify → Monday Sync!"
+
+@app.route("/lodgify-properties", methods=["GET"])
+def lodgify_props():
+    props = fetch_properties()
+    return jsonify({"count":len(props),"sample":props[:3]})
 
 @app.route("/lodgify-webhook", methods=["POST"])
 def lodgify_webhook():
@@ -157,15 +103,16 @@ def lodgify_webhook():
     result = upsert_booking(payload)
     return jsonify({"status":"ok","monday_response":result})
 
+# --- DEBUG Route ---
 @app.route("/lodgify-sync-all", methods=["GET"])
 def lodgify_sync_all():
-    bookings = fetch_bookings()
-    results=[]
-    for b in bookings:
-        results.append(upsert_booking(b))
-    return jsonify({"status":"done","count":len(results),"sample":results[:3]})
-
-@app.route("/lodgify-properties", methods=["GET"])
-def lodgify_props():
-    props = fetch_properties()
-    return jsonify({"count":len(props),"sample":props[:3]})
+    """
+    Debug: აბრუნებს Lodgify API response-ის სტატუსსა და ტექსტს
+    რომ დავრწმუნდეთ რეალურად რას აბრუნებს.
+    """
+    url = "https://api.lodgify.com/v2/reservations/bookings"
+    resp = requests.get(url, headers={"X-ApiKey": LODGY_API_KEY})
+    return jsonify({
+        "status": resp.status_code,
+        "text": resp.text[:1000]   # მხოლოდ პირველი 1000 სიმბოლო, რომ ძალიან დიდი არ იყოს
+    })
