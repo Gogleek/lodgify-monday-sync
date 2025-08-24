@@ -1,11 +1,14 @@
 # app.py
 from flask import Flask, request, jsonify
-import requests, json, os, traceback
+import os, json, re, traceback
 from datetime import datetime, date
+import requests
 
 app = Flask(__name__)
 
-# ===== ENV =====
+# ======================
+# ENV & CONSTANTS
+# ======================
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "2112686712"))
 LODGY_API_KEY = os.getenv("LODGY_API_KEY")
@@ -13,49 +16,82 @@ LODGY_API_KEY = os.getenv("LODGY_API_KEY")
 if not MONDAY_API_TOKEN or not LODGY_API_KEY:
     raise RuntimeError("Set MONDAY_API_TOKEN and LODGY_API_KEY env vars.")
 
-LODGY_HEADERS = {"X-ApiKey": LODGY_API_KEY}
 MONDAY_HEADERS = {"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"}
+LODGY_HEADERS = {"X-ApiKey": LODGY_API_KEY}
 
-# caches
-COLUMN_ID_MAP = None            # monday column mapping
-PROPS_CACHE = None              # property.name -> property.id
+# Caches
+COLUMN_ID_MAP: dict | None = None
+PROPS_BY_ID: dict | None = None
+PROPS_BY_NAME: dict | None = None
 
+# dropdown known labels (extendable)
+DEFAULT_SOURCE_LABELS = ["Booking.com", "Airbnb", "Expedia", "Vrbo", "Manual", "Direct"]
 
-# ===== Lodgify =====
-def fetch_lodgify_bookings():
+# Source normalization map (lowercased, non-alnum stripped)
+SOURCE_NORMALIZE_MAP = {
+    "bookingcom": "Booking.com",
+    "booking.com": "Booking.com",
+    "bookingcomheavenlystays": "Booking.com",
+    "bookingcomheavenlystaysqueensgardens": "Booking.com",
+    "airbnb": "Airbnb",
+    "expedia": "Expedia",
+    "vrbo": "Vrbo",
+    "homeaway": "Vrbo",
+    "manual": "Manual",
+    "direct": "Direct",
+}
+
+# ======================
+# Lodgify helpers
+# ======================
+def lodgify_get(url: str, **kw):
+    r = requests.get(url, headers=LODGY_HEADERS, timeout=kw.pop("timeout", 30))
+    return r
+
+def fetch_lodgify_bookings() -> list[dict]:
+    """
+    v2/reservations/bookings → {"count": X, "items": [ ... ]}
+    """
     url = "https://api.lodgify.com/v2/reservations/bookings"
-    r = requests.get(url, headers=LODGY_HEADERS, timeout=30)
+    r = lodgify_get(url)
     if r.status_code != 200:
-        app.logger.error(f"Lodgify error {r.status_code}: {r.text[:300]}")
+        app.logger.error(f"[Lodgify] {r.status_code} {r.text[:300]}")
         return []
     try:
         data = r.json()
     except Exception as e:
-        app.logger.exception(f"Lodgify JSON parse error: {e}")
+        app.logger.exception(f"[Lodgify] JSON parse error: {e}")
         return []
-    return data.get("items", [])
+    return data.get("items", []) or []
 
-
-def fetch_lodgify_properties_map():
-    """Map property.name -> property.id (fallback თუ booking-ში id არაა)."""
-    global PROPS_CACHE
-    if PROPS_CACHE is not None:
-        return PROPS_CACHE
+def fetch_lodgify_properties_index():
+    """
+    v1/properties → list of {id, name, ...}
+    Builds both id→name and name→id maps.
+    """
+    global PROPS_BY_ID, PROPS_BY_NAME
+    if PROPS_BY_ID is not None and PROPS_BY_NAME is not None:
+        return PROPS_BY_ID, PROPS_BY_NAME
 
     url = "https://api.lodgify.com/v1/properties"
-    mp = {}
+    id_map, name_map = {}, {}
     try:
-        r = requests.get(url, headers=LODGY_HEADERS, timeout=30)
+        r = lodgify_get(url)
         if r.status_code == 200:
             for p in r.json():
+                pid = p.get("id")
                 nm = (p.get("name") or "").strip()
+                if pid is not None:
+                    id_map[str(pid)] = nm
                 if nm:
-                    mp[nm] = p.get("id")
-    except Exception:
-        pass
-    PROPS_CACHE = mp
-    return mp
+                    name_map[nm] = str(pid) if pid is not None else ""
+        else:
+            app.logger.warning(f"[Lodgify] properties {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        app.logger.warning(f"[Lodgify] properties fetch fail: {e}")
 
+    PROPS_BY_ID, PROPS_BY_NAME = id_map, name_map
+    return PROPS_BY_ID, PROPS_BY_NAME
 
 def parse_date(s: str | None):
     if not s:
@@ -65,8 +101,7 @@ def parse_date(s: str | None):
     except Exception:
         return None
 
-
-def days_between(a: str | None, b: str | None):
+def days_between(a: str | None, b: str | None) -> str:
     if not a or not b:
         return ""
     da, db = parse_date(a), parse_date(b)
@@ -74,23 +109,29 @@ def days_between(a: str | None, b: str | None):
         return ""
     return str((db - da).days)
 
+def normalize_source_label(raw: str | None) -> str:
+    if not raw:
+        return ""
+    key = re.sub(r"[^a-z0-9]+", "", str(raw).lower())
+    return SOURCE_NORMALIZE_MAP.get(key, raw.strip())
 
-def derive_source(booking: dict) -> str:
-    src = booking.get("source") or booking.get("channel") or ""
-    if src:
-        return str(src)
-    em = (booking.get("guest") or {}).get("email") or ""
-    em = em.lower()
-    if "guest.booking.com" in em:
-        return "Booking.com"
-    if "airbnb.com" in em:
-        return "Airbnb"
-    if "expedia" in em:
-        return "Expedia"
-    if "vrbo" in em or "homeaway" in em:
-        return "Vrbo"
-    return ""
+def derive_source(b: dict) -> str:
+    # prefer Lodgify native source/channel
+    src = b.get("source") or b.get("channel") or ""
+    src = normalize_source_label(src)
 
+    if not src:
+        em = ((b.get("guest") or {}).get("email") or "").lower()
+        if "guest.booking.com" in em or "booking.com" in em:
+            src = "Booking.com"
+        elif "airbnb.com" in em:
+            src = "Airbnb"
+        elif "expedia" in em:
+            src = "Expedia"
+        elif "vrbo" in em or "homeaway" in em:
+            src = "Vrbo"
+
+    return normalize_source_label(src)
 
 def compute_status_label(check_in: str | None, check_out: str | None) -> str:
     today = date.today()
@@ -103,63 +144,89 @@ def compute_status_label(check_in: str | None, check_out: str | None) -> str:
         return "Completed"
     return ""
 
-
 def extract_booking_fields(b: dict) -> dict:
-    bid = b.get("id") or b.get("bookingId")
+    """
+    Flattens Lodgify booking into Monday fields.
+    """
+    # IDs
+    booking_id = b.get("id") or b.get("bookingId")
+    booking_id = str(booking_id) if booking_id is not None else ""
 
-    guest = b.get("guest") or {}
-    prop = b.get("property") or {}
-
-    guest_name = guest.get("name") or "N/A"
-    guest_email = guest.get("email") or ""
-
+    # Dates
     check_in = b.get("arrival") or b.get("check_in_date") or ""
     check_out = b.get("departure") or b.get("check_out_date") or ""
-
-    prop_name = prop.get("name") or "" if isinstance(prop, dict) else ""
-    prop_id = ""
-    if isinstance(prop, dict):
-        pid = prop.get("id")
-        if pid is None and prop_name:
-            pid = fetch_lodgify_properties_map().get(prop_name)
-        if pid is not None:
-            prop_id = str(pid)
-
     nights = days_between(check_in, check_out)
+
+    # Guest
+    g = b.get("guest") or {}
+    guest_name = g.get("name") or "N/A"
+    guest_email = g.get("email") or ""
+    guest_phone = g.get("phone") or ""
+
+    # Property
+    prop_id = b.get("property_id")
+    prop_name = ""
+    # Some payloads include {property: {id, name}}, support that too:
+    prop = b.get("property") if isinstance(b.get("property"), dict) else None
+    if prop is not None:
+        prop_id = prop_id or prop.get("id")
+        prop_name = prop.get("name") or ""
+
+    if prop_id is not None and str(prop_id):
+        prop_id = str(prop_id)
+        if not prop_name:
+            id_map, _ = fetch_lodgify_properties_index()
+            prop_name = id_map.get(prop_id, "")
+    else:
+        prop_id = ""
+
+    # Source & status
     source = derive_source(b)
     status_label = compute_status_label(check_in, check_out)
 
+    # Raw JSON (truncate for Monday long_text)
+    raw_json = json.dumps(b, ensure_ascii=False)
+    if len(raw_json) > 15000:
+        raw_json = raw_json[:15000]
+
     return {
-        "booking_id": str(bid) if bid is not None else "",
+        "booking_id": booking_id,
         "guest": guest_name,
         "email": guest_email,
+        "phone": guest_phone,          # optional column (if you add it)
         "check_in": check_in,
         "check_out": check_out,
+        "nights": nights,
         "property": prop_name,
         "property_id": prop_id,
-        "nights": nights,
         "source": source,
         "status_label": status_label,
         "last_sync": date.today().strftime("%Y-%m-%d"),
-        "raw_json": json.dumps(b, ensure_ascii=False)[:15000],  # უსაფრთხო ჭრა
+        "raw_json": raw_json,
+        # extra (if you add these columns in Monday, we can map later)
+        "booking_status": b.get("status") or "",                 # text
+        "currency": b.get("currency_code") or "",                # text
+        "total_amount": str((b.get("total_amount") or "")).strip(),  # numbers
+        "amount_paid": str((b.get("amount_paid") or "")).strip(),    # numbers
+        "amount_due": str((b.get("amount_due") or "")).strip(),      # numbers
+        "source_text": b.get("source_text") or "",               # long_text
+        "language": b.get("language") or "",                     # text
     }
 
-
-# ===== Monday Core =====
+# ======================
+# Monday GraphQL helpers
+# ======================
 def monday_graphql(query: str, variables: dict):
-    r = requests.post(
-        "https://api.monday.com/v2",
-        headers=MONDAY_HEADERS,
-        json={"query": query, "variables": variables},
-        timeout=60,
-    )
+    r = requests.post("https://api.monday.com/v2",
+                      headers=MONDAY_HEADERS,
+                      json={"query": query, "variables": variables},
+                      timeout=60)
     try:
         return r.json()
     except Exception:
-        return {"errors": [{"message": f"Bad JSON from Monday: {r.status_code}", "raw": r.text[:300]}]}
+        return {"errors": [{"message": f"Bad JSON {r.status_code}", "raw": r.text[:300]}]}
 
-
-def get_board_columns(include_settings: bool = False):
+def get_board_columns(include_settings: bool = False) -> list[dict]:
     extra = " settings_str" if include_settings else ""
     q = f"""
     query($board: [ID!]!) {{
@@ -174,13 +241,13 @@ def get_board_columns(include_settings: bool = False):
     try:
         return resp["data"]["boards"][0]["columns"]
     except Exception:
-        app.logger.error(f"Cannot read board columns. Response: {resp}")
+        app.logger.error(f"[Monday] get_board_columns bad resp: {resp}")
         return []
-
 
 def ensure_columns_and_get_map() -> dict:
     """
-    Required columns (exact titles):
+    Ensures required columns exist and returns a map key→column_id.
+    Required (exact titles):
       Booking ID(text), Property(text), Property ID(text), Guest(text), Email(email),
       Check-in(date), Check-out(date), Nights(numbers), Source(dropdown),
       Status(status), Last Sync(date), Raw JSON(long_text)
@@ -202,6 +269,15 @@ def ensure_columns_and_get_map() -> dict:
         ("status", "Status", "STATUS"),
         ("last_sync", "Last Sync", "DATE"),
         ("raw_json", "Raw JSON", "LONG_TEXT"),
+        # Optional extras (uncomment if you already created these on the board):
+        # ("phone", "Phone", "PHONE"),
+        # ("booking_status", "Booking Status", "TEXT"),
+        # ("currency", "Currency", "TEXT"),
+        # ("total_amount", "Total Amount", "NUMBERS"),
+        # ("amount_paid", "Amount Paid", "NUMBERS"),
+        # ("amount_due", "Amount Due", "NUMBERS"),
+        # ("source_text", "Source Text", "LONG_TEXT"),
+        # ("language", "Language", "TEXT"),
     ]
 
     cols = get_board_columns(include_settings=True)
@@ -219,7 +295,7 @@ def ensure_columns_and_get_map() -> dict:
         if c:
             id_map[key] = c["id"]
             continue
-        # create if missing
+        # create missing column
         q = """
         mutation($board: ID!, $title: String!, $ctype: ColumnType!) {
           create_column(board_id: $board, title: $title, column_type: $ctype) { id }
@@ -231,13 +307,12 @@ def ensure_columns_and_get_map() -> dict:
             id_map[key] = new_id
             cols.append({"id": new_id, "title": title, "type": ctype})
         except Exception:
-            app.logger.error(f"Failed to create column '{title}' ({ctype}). resp={resp}")
-            id_map[key] = title  # worst-case placeholder (mutations შეიძლება ჩავარდეს)
+            app.logger.error(f"[Monday] failed to create column '{title}' ({ctype}). resp={resp}")
+            id_map[key] = title  # placeholder
 
     COLUMN_ID_MAP = id_map
-    app.logger.info(f"Column map: {COLUMN_ID_MAP}")
+    app.logger.info(f"[Monday] Column map: {COLUMN_ID_MAP}")
     return COLUMN_ID_MAP
-
 
 def find_item_by_booking_id(booking_id: str) -> int | None:
     q = """
@@ -256,7 +331,7 @@ def find_item_by_booking_id(booking_id: str) -> int | None:
     try:
         items = resp["data"]["boards"][0]["items_page"]["items"]
     except Exception:
-        app.logger.error(f"find_item_by_booking_id bad response: {resp}")
+        app.logger.error(f"[Monday] find_item... bad resp: {resp}")
         return None
 
     bid_col = ensure_columns_and_get_map()["booking_id"]
@@ -266,17 +341,16 @@ def find_item_by_booking_id(booking_id: str) -> int | None:
                 return int(it["id"])
     return None
 
-
 def parse_settings_labels(settings_str: str | None) -> list[str]:
-    """Extract labels list (for status/dropdown) from settings_str JSON."""
     try:
         s = json.loads(settings_str or "{}")
     except Exception:
         return []
     labels_map = s.get("labels") or {}
     if isinstance(labels_map, dict):
-        # {"0":"Working on it","1":"Done", ...}
+        # {"0":"Working on it","1":"Done",...}
         try:
+            # keep index order if numeric keys
             return [v for k, v in sorted(labels_map.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 999)]
         except Exception:
             return list(labels_map.values())
@@ -284,22 +358,49 @@ def parse_settings_labels(settings_str: str | None) -> list[str]:
         return labels_map
     return []
 
+def ensure_dropdown_label_exists(column_key: str, wanted: str):
+    """For dropdown columns: if label missing, extend labels via change_column_settings."""
+    if not wanted:
+        return
+    cmap = ensure_columns_and_get_map()
+    col_id = cmap[column_key]
+
+    cols = get_board_columns(include_settings=True)
+    col = next((c for c in cols if c["id"] == col_id), None)
+    existing = parse_settings_labels((col or {}).get("settings_str"))
+
+    merged: list[str] = []
+    for x in (existing or []) + DEFAULT_SOURCE_LABELS + [wanted]:
+        if x and x not in merged:
+            merged.append(x)
+
+    if set(existing or []) == set(merged):
+        return
+
+    settings_str = json.dumps({"labels": merged})
+    q = """
+    mutation($board: ID!, $column_id: ID!, $settings_str: String!) {
+      change_column_settings(board_id: $board, column_id: $column_id, settings_str: $settings_str) { id }
+    }
+    """
+    resp = monday_graphql(q, {"board": BOARD_ID, "column_id": col_id, "settings_str": settings_str})
+    app.logger.info(f"[Monday] Updated dropdown '{col_id}' labels → {merged}. resp={resp}")
 
 def build_column_values(fields: dict) -> dict:
     """
-    Formats:
-      TEXT      -> plain string
+    Mapping to Monday payloads:
+      TEXT      -> "string"
       EMAIL     -> {"email":"...","text":"..."}
       DATE      -> {"date":"YYYY-MM-DD"}
-      NUMBERS   -> plain string (e.g. "3")
-      DROPDOWN  -> {"labels": ["..."]}
-      STATUS    -> {"label": "In house"}  (ONLY if label exists on the board)
-      LONG_TEXT -> {"text": "..."}
+      NUMBERS   -> "numeric-string"
+      DROPDOWN  -> {"labels":["..."]}  (ensure label exists)
+      STATUS    -> {"label":"..."}     (only if label exists; else skip)
+      LONG_TEXT -> {"text":"..."}
     """
     cmap = ensure_columns_and_get_map()
     colvals: dict[str, object] = {}
 
-    # helpers
+    # --- simple mappers ---
     def set_text(key, val):
         v = (val or "").strip()
         if v:
@@ -321,8 +422,9 @@ def build_column_values(fields: dict) -> dict:
             colvals[cmap[key]] = {"email": v, "text": v}
 
     def set_dropdown(key, label):
-        v = (label or "").strip()
+        v = normalize_source_label(label or "")
         if v:
+            ensure_dropdown_label_exists(key, v)
             colvals[cmap[key]] = {"labels": [v]}
 
     def set_status_if_exists(label):
@@ -337,9 +439,9 @@ def build_column_values(fields: dict) -> dict:
         if label in labels:
             colvals[status_id] = {"label": label}
         else:
-            app.logger.info(f"Status label '{label}' not present. Skipping status set.")
+            app.logger.info(f"[Monday] status label '{label}' absent. Skipping status set.")
 
-    # map fields
+    # --- required fields ---
     set_text("booking_id",  fields.get("booking_id"))
     set_text("guest",       fields.get("guest"))
     set_email("email",      fields.get("email"))
@@ -357,8 +459,20 @@ def build_column_values(fields: dict) -> dict:
 
     set_status_if_exists(fields.get("status_label"))
 
-    return colvals
+    # --- optional extras (only if you uncommented them in ensure_columns_and_get_map) ---
+    # if "phone" in cmap:           set_text("phone", fields.get("phone"))
+    # if "booking_status" in cmap:  set_text("booking_status", fields.get("booking_status"))
+    # if "currency" in cmap:        set_text("currency", fields.get("currency"))
+    # if "total_amount" in cmap:    set_number("total_amount", fields.get("total_amount"))
+    # if "amount_paid" in cmap:     set_number("amount_paid", fields.get("amount_paid"))
+    # if "amount_due" in cmap:      set_number("amount_due", fields.get("amount_due"))
+    # if "source_text" in cmap:
+    #     st = (fields.get("source_text") or "").strip()
+    #     if st:
+    #         colvals[cmap["source_text"]] = {"text": st}
+    # if "language" in cmap:        set_text("language", fields.get("language"))
 
+    return colvals
 
 def upsert_to_monday(fields: dict) -> dict:
     booking_id = (fields.get("booking_id") or "").strip()
@@ -385,10 +499,10 @@ def upsert_to_monday(fields: dict) -> dict:
     name = f"Booking {booking_id}"
     return monday_graphql(q, {"board": BOARD_ID, "name": name, "vals": colvals_json})
 
-
-# ===== Safe wrapper for batch =====
+# ======================
+# Batch-safe wrapper
+# ======================
 def safe_upsert(booking: dict, debug: bool = False) -> dict:
-    """Upsert one booking safely; never raise."""
     try:
         fields = extract_booking_fields(booking)
         resp = upsert_to_monday(fields)
@@ -405,24 +519,22 @@ def safe_upsert(booking: dict, debug: bool = False) -> dict:
                 pass
         return err
 
-
-# ===== Routes =====
+# ======================
+# Routes
+# ======================
 @app.route("/")
 def home():
     return "Hello from Lodgify → Monday Sync!"
 
-
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
-
 
 @app.route("/columns")
 def columns():
     cols = get_board_columns(include_settings=True)
     cmap = ensure_columns_and_get_map()
     return jsonify({"board_id": BOARD_ID, "columns": cols, "mapping": cmap})
-
 
 @app.route("/lodgify-webhook", methods=["POST"])
 def lodgify_webhook():
@@ -432,14 +544,13 @@ def lodgify_webhook():
     resp = upsert_to_monday(fields)
     return jsonify({"status": "ok", "fields": fields, "monday": resp})
 
-
 @app.route("/lodgify-sync-all", methods=["GET"])
 def lodgify_sync_all():
     """
     Batch sync with resilience:
       - ?limit=20  (default 5)
       - ?skip=0
-      - ?debug=1   => include per-item error details
+      - ?debug=1   include per-item errors/trace
     """
     # limit
     try:
@@ -448,7 +559,6 @@ def lodgify_sync_all():
             limit = 5
     except Exception:
         limit = 5
-
     # skip
     try:
         skip = int(request.args.get("skip", "0"))
@@ -463,8 +573,7 @@ def lodgify_sync_all():
     window = all_items[skip: skip + limit]
 
     results = []
-    ok_count = 0
-    err_count = 0
+    ok_count = err_count = 0
 
     for b in window:
         r = safe_upsert(b, debug=debug)
