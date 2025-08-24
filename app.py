@@ -1,17 +1,41 @@
 from flask import Flask, request, jsonify
-import requests, json, os
+import requests, os, json
 
 app = Flask(__name__)
 
-# === Environment Variables ===
+# ENV VARIABLES
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "2112686712"))
-LODGY_API_KEY = os.getenv("LODGY_API_KEY")  # Lodgify API key
+LODGY_API_KEY = os.getenv("LODGY_API_KEY")
 
+LODGY_BASE = "https://api.lodgify.com/v1"
 
-# === Helpers ===
+# === Lodgify Helpers ===
+def fetch_properties():
+    url = f"{LODGY_BASE}/properties"
+    resp = requests.get(url, headers={"X-ApiKey": LODGY_API_KEY})
+    return resp.json() if resp.status_code == 200 else []
+
+def fetch_reservations():
+    """Get all reservations (bookings) with pagination"""
+    all_res = []
+    page = 1
+    while True:
+        url = f"{LODGY_BASE}/reservations?page={page}&pageSize=50"
+        resp = requests.get(url, headers={"X-ApiKey": LODGY_API_KEY})
+        if resp.status_code != 200:
+            break
+        data = resp.json()
+        if not data:
+            break
+        all_res.extend(data)
+        if len(data) < 50:
+            break
+        page += 1
+    return all_res
+
+# === Monday Helpers ===
 def find_existing_item(booking_id):
-    """ამოწმებს Monday-ზე არსებობს თუ არა ეს booking_id"""
     query = """
     query ($board: Int!) {
       boards(ids: [$board]) {
@@ -32,9 +56,8 @@ def find_existing_item(booking_id):
         headers={"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"},
         json={"query": query, "variables": {"board": BOARD_ID}}
     )
-    data = resp.json()
     try:
-        items = data["data"]["boards"][0]["items_page"]["items"]
+        items = resp.json()["data"]["boards"][0]["items_page"]["items"]
         for it in items:
             for col in it["column_values"]:
                 if col["id"] == "booking_id" and col["text"] == str(booking_id):
@@ -43,9 +66,7 @@ def find_existing_item(booking_id):
         pass
     return None
 
-
 def upsert_booking(booking):
-    """თუ booking არსებობს → update, თუ არა → create"""
     booking_id = booking.get("id")
     guest = booking.get("guest", {}).get("name", "N/A")
     email = booking.get("guest", {}).get("email", "")
@@ -90,12 +111,10 @@ def upsert_booking(booking):
     )
     return r.json()
 
-
-# === Routes ===
+# === Flask Routes ===
 @app.route("/")
 def home():
     return "Hello from Lodgify → Monday Sync!"
-
 
 @app.route("/lodgify-webhook", methods=["POST"])
 def lodgify_webhook():
@@ -103,41 +122,20 @@ def lodgify_webhook():
     result = upsert_booking(payload)
     return jsonify({"status": "ok", "monday_response": result})
 
-
 @app.route("/lodgify-sync-all", methods=["GET"])
 def lodgify_sync_all():
-    url = "https://api.lodgify.com/v1/reservations"
-    headers = {"X-ApiKey": LODGY_API_KEY}
-
-    all_bookings = []
-    page = 1
-
-    while True:
-        resp = requests.get(f"{url}?page={page}&pageSize=50", headers=headers)
-        if resp.status_code != 200:
-            return jsonify({
-                "error": "Lodgify API error",
-                "status": resp.status_code,
-                "text": resp.text
-            }), 500
-
-        data = resp.json()
-        if not data:
-            break
-
-        all_bookings.extend(data)
-        page += 1
-
-        # თუ დაბრუნდა ნაკლები ვიდრე pageSize → ბოლო გვერდია
-        if len(data) < 50:
-            break
-
+    reservations = fetch_reservations()
     results = []
-    for b in all_bookings:
-        results.append(upsert_booking(b))
+    for r in reservations:
+        results.append(upsert_booking(r))
 
     return jsonify({
         "status": "done",
         "count": len(results),
-        "details": results[:5]  # პირველ 5 პასუხს გაჩვენებს, რომ არ გადაიტვირთოს
+        "sample": results[:3]   # მხოლოდ პირველი 3 რომ რენდერი არ გაწყდეს
     })
+
+@app.route("/lodgify-properties", methods=["GET"])
+def lodgify_properties():
+    props = fetch_properties()
+    return jsonify({"count": len(props), "properties": props[:5]})
