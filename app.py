@@ -51,12 +51,10 @@ def to_iso_date(v) -> Optional[str]:
         if not v:
             return None
     s = str(v).strip()
-    # Try strict ISO first
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
     except Exception:
         pass
-    # Try YYYY-MM-DD prefix
     try:
         return datetime.strptime(s[:10], "%Y-%m-%d").date().isoformat()
     except Exception:
@@ -93,7 +91,7 @@ COLUMN_MAP = {
     "unit":           "text_mkv49eqm",     # Property (Text)
     "property_id":    "text_mkv4n35j",     # Property ID (Text)
     "guest_name":     "text_mkv46pev",     # Guest (Text)
-    "email":          "email_mkv4mbte",    # Email
+    "email":          "email_mkv4mbte",    # Email (email column)
     "phone":          "phone_mkv4yk8k",    # Phone
     "check_in":       "date_mkv4npgx",     # Check-in (Date)
     "check_out":      "date_mkv46w1t",     # Check-out (Date)
@@ -132,11 +130,12 @@ STATUS_LABELS = {
 }
 STATUS_DEFAULT = "Pending"
 
+# NOTE: ბორდზე რეალურად არსებული labels – Manual/Direct ამოღებულია, რომ ერორი აღარ მივიღოთ
 SOURCE_LABELS = {
-    "manual": "Manual",
     "booking.com": "Booking.com",
     "airbnb": "Airbnb",
-    "direct": "Direct",
+    "expedia": "Expedia",
+    "vrbo": "Vrbo",
 }
 
 def put(cv: dict, logical_key: str, value):
@@ -160,7 +159,6 @@ def build_session(default_timeout=45) -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    # Attach a default timeout to session by wrapping 'request'
     original_request = s.request
     def _request(method, url, **kwargs):
         kwargs.setdefault("timeout", default_timeout)
@@ -236,7 +234,6 @@ class MondayClient:
         self.api_key = api_key
         self.board_id = board_id
         self.session = build_session()
-        # Monday GraphQL expects: Authorization: <token>
         self.session.headers.update({
             "Authorization": self.api_key,
             "Content-Type": "application/json",
@@ -290,12 +287,17 @@ class MondayClient:
         return int(data["create_item"]["id"])
 
     def update_item(self, item_id: int, column_values: Dict[str, object]) -> int:
+        # >>> FIX: board_id დამატებულია
         query = """
-        mutation($item_id: ID!, $cols: JSON!) {
-          change_multiple_column_values(item_id: $item_id, column_values: $cols) { id }
+        mutation($board_id: ID!, $item_id: ID!, $cols: JSON!) {
+          change_multiple_column_values(board_id: $board_id, item_id: $item_id, column_values: $cols) { id }
         }
         """
-        data = self._gql(query, {"item_id": str(item_id), "cols": json.dumps(column_values)})
+        data = self._gql(query, {
+            "board_id": str(self.board_id),
+            "item_id": str(item_id),
+            "cols": json.dumps(column_values)
+        })
         return int(data["change_multiple_column_values"]["id"])
 
     def upsert_item(self, mapped: dict) -> UpsertResult:
@@ -367,7 +369,10 @@ def map_booking_to_monday(bk: dict) -> dict:
         else:
             first_name = " ".join(parts[:-1]); last_name = parts[-1]
     display_name = (f"{first_name} {last_name}".strip() or full_name) or (f"Booking {res_id}" if res_id else "Booking")
-    email = guest.get("email") or ""
+
+    # >>> FIX: Email ფორმატი სწორია; ცარიელზე საერთოდ არ ვწერთ
+    email_val = (guest.get("email") or "").strip()
+
     phone = normalize_phone(guest.get("phone") or guest.get("mobile") or "")
 
     # dates
@@ -415,7 +420,11 @@ def map_booking_to_monday(bk: dict) -> dict:
     put(cv, "unit", unit_name)
     put(cv, "property_id", str(property_id) if property_id else None)
     put(cv, "guest_name", display_name)
-    put(cv, "email", email or None)
+
+    # >>> FIX: email write
+    if email_val:
+        put(cv, "email", {"email": email_val, "text": email_val})
+
     put(cv, "phone", phone or None)
 
     put(cv, "check_in",  {"date": check_in}   if check_in  else None)
@@ -484,7 +493,6 @@ def _unhandled(e):
 
 @app.get("/health")
 def health():
-    # Fast sanity to avoid “works on my machine” BS
     env_ok = bool(LODGY_API_KEY and MONDAY_API_KEY and MONDAY_BOARD_ID > 0)
     return jsonify({
         "ok": True,
@@ -541,7 +549,6 @@ def diag_ping_lodgify():
 @app.get("/diag/ping-monday")
 def diag_ping_monday():
     try:
-        # Minimal query to check auth
         data = monday._gql("query { me { id name } }")
         return jsonify({"ok": True, "me": data.get("me")}), 200
     except Exception as e:
@@ -585,7 +592,7 @@ def lodgify_sync_all():
         try:
             resp["sample_input"] = bookings[:1]
             resp["sample_mapped"] = map_booking_to_monday(bookings[0])
-        except Exception as _:
+        except Exception:
             pass
     return jsonify(resp), 200
 
