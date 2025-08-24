@@ -3,16 +3,19 @@ import requests, json, os
 
 app = Flask(__name__)
 
+# === Environment Variables ===
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "2112686712"))
 LODGY_API_KEY = os.getenv("LODGY_API_KEY")  # Lodgify API key
 
 
+# === Helpers ===
 def find_existing_item(booking_id):
+    """ამოწმებს Monday-ზე არსებობს თუ არა ეს booking_id"""
     query = """
     query ($board: Int!) {
       boards(ids: [$board]) {
-        items_page {
+        items_page(limit: 200) {
           items {
             id
             column_values {
@@ -42,6 +45,7 @@ def find_existing_item(booking_id):
 
 
 def upsert_booking(booking):
+    """თუ booking არსებობს → update, თუ არა → create"""
     booking_id = booking.get("id")
     guest = booking.get("guest", {}).get("name", "N/A")
     email = booking.get("guest", {}).get("email", "")
@@ -68,7 +72,6 @@ def upsert_booking(booking):
           }
         }
         """ % BOARD_ID
-
         variables = {"item": int(existing), "colvals": json.dumps(colvals)}
     else:
         mutation = """
@@ -88,6 +91,7 @@ def upsert_booking(booking):
     return r.json()
 
 
+# === Routes ===
 @app.route("/")
 def home():
     return "Hello from Lodgify → Monday Sync!"
@@ -102,13 +106,38 @@ def lodgify_webhook():
 
 @app.route("/lodgify-sync-all", methods=["GET"])
 def lodgify_sync_all():
-    url = "https://api.lodgify.com/v2/bookings"   # აქ თუ შეცდომაა, გამოჩნდება
+    url = "https://api.lodgify.com/v1/reservations"
     headers = {"X-ApiKey": LODGY_API_KEY}
-    resp = requests.get(url, headers=headers)
 
-    # Debug output
+    all_bookings = []
+    page = 1
+
+    while True:
+        resp = requests.get(f"{url}?page={page}&pageSize=50", headers=headers)
+        if resp.status_code != 200:
+            return jsonify({
+                "error": "Lodgify API error",
+                "status": resp.status_code,
+                "text": resp.text
+            }), 500
+
+        data = resp.json()
+        if not data:
+            break
+
+        all_bookings.extend(data)
+        page += 1
+
+        # თუ დაბრუნდა ნაკლები ვიდრე pageSize → ბოლო გვერდია
+        if len(data) < 50:
+            break
+
+    results = []
+    for b in all_bookings:
+        results.append(upsert_booking(b))
+
     return jsonify({
-        "lodgify_status": resp.status_code,
-        "lodgify_url": url,
-        "lodgify_text": resp.text[:1000]  # პირველი 1000 სიმბოლო, რომ დავინახოთ error ან data
+        "status": "done",
+        "count": len(results),
+        "details": results[:5]  # პირველ 5 პასუხს გაჩვენებს, რომ არ გადაიტვირთოს
     })
