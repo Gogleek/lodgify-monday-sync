@@ -8,9 +8,7 @@ BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "2112686712"))
 LODGY_API_KEY = os.getenv("LODGY_API_KEY")  # Lodgify API key
 
 
-# === Helpers ===
 def find_existing_item(booking_id):
-    """ამოწმებს Monday-ში არსებობს თუ არა ეს booking_id"""
     query = """
     query ($board: Int!) {
       boards(ids: [$board]) {
@@ -44,7 +42,6 @@ def find_existing_item(booking_id):
 
 
 def upsert_booking(booking):
-    """თუ booking არსებობს → update, თუ არა → create"""
     booking_id = booking.get("id")
     guest = booking.get("guest", {}).get("name", "N/A")
     email = booking.get("guest", {}).get("email", "")
@@ -96,7 +93,6 @@ def home():
     return "Hello from Lodgify → Monday Sync!"
 
 
-# === Webhook: ახალი ან განახლებული booking ===
 @app.route("/lodgify-webhook", methods=["POST"])
 def lodgify_webhook():
     payload = request.json or {}
@@ -104,21 +100,15 @@ def lodgify_webhook():
     return jsonify({"status": "ok", "monday_response": result})
 
 
-# === One-time sync: ყველა არსებული booking Lodgify-დან ===
 @app.route("/lodgify-sync-all", methods=["GET"])
 def lodgify_sync_all():
-    url = "https://api.lodgify.com/v2/bookings"
+    url = "https://api.lodgify.com/v2/bookings"   # აქ თუ შეცდომაა, გამოჩნდება
     headers = {"X-ApiKey": LODGY_API_KEY}
     resp = requests.get(url, headers=headers)
 
-    if resp.status_code != 200:
-        return jsonify({"error": f"Lodgify API error {resp.status_code}", "text": resp.text}), 500
-
-    bookings = resp.json()
-    results = []
-
-    for b in bookings:
-        results.append(upsert_booking(b))
-
-    return jsonify({"status": "done", "count": len(results), "details": results})
-
+    # Debug output
+    return jsonify({
+        "lodgify_status": resp.status_code,
+        "lodgify_url": url,
+        "lodgify_text": resp.text[:1000]  # პირველი 1000 სიმბოლო, რომ დავინახოთ error ან data
+    })
