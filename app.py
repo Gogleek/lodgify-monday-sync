@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import requests, json, os, re
+import requests, json, os
 
 app = Flask(__name__)
 
@@ -18,6 +18,15 @@ def fetch_properties():
     r = requests.get("https://api.lodgify.com/v1/properties", headers=HEADERS, timeout=30)
     r.raise_for_status()
     return r.json()
+
+def fetch_bookings():
+    """Lodgify → bookings.items ამოიღოს"""
+    url = "https://api.lodgify.com/v2/reservations/bookings"
+    resp = requests.get(url, headers={"X-ApiKey": LODGY_API_KEY})
+    if resp.status_code != 200:
+        return []
+    data = resp.json()
+    return data.get("items", [])
 
 # --- Monday Helpers ---
 def find_existing_item(booking_id):
@@ -55,8 +64,8 @@ def upsert_booking(b):
     bid = b.get("id") or b.get("bookingId")
     guest = b.get("guest", {}).get("name", "N/A")
     email = b.get("guest", {}).get("email", "")
-    check_in = b.get("check_in_date")
-    check_out= b.get("check_out_date")
+    check_in = b.get("arrival")
+    check_out= b.get("departure")
     pname = b.get("property",{}).get("name") if isinstance(b.get("property"),dict) else "N/A"
 
     colvals = {
@@ -87,7 +96,7 @@ def upsert_booking(b):
         json={"query": mutation,"variables": variables})
     return r.json()
 
-# --- Routes ---
+# --- Flask Routes ---
 @app.route("/")
 def home():
     return "Hello from Lodgify → Monday Sync!"
@@ -103,16 +112,15 @@ def lodgify_webhook():
     result = upsert_booking(payload)
     return jsonify({"status":"ok","monday_response":result})
 
-# --- DEBUG Route ---
 @app.route("/lodgify-sync-all", methods=["GET"])
 def lodgify_sync_all():
-    """
-    Debug: აბრუნებს Lodgify API response-ის სტატუსსა და ტექსტს
-    რომ დავრწმუნდეთ რეალურად რას აბრუნებს.
-    """
-    url = "https://api.lodgify.com/v2/reservations/bookings"
-    resp = requests.get(url, headers={"X-ApiKey": LODGY_API_KEY})
+    bookings = fetch_bookings()
+    results = []
+    for b in bookings:
+        results.append(upsert_booking(b))
+
     return jsonify({
-        "status": resp.status_code,
-        "text": resp.text[:1000]   # მხოლოდ პირველი 1000 სიმბოლო, რომ ძალიან დიდი არ იყოს
+        "status": "done",
+        "count": len(results),
+        "sample": results[:3]
     })
