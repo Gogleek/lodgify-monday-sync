@@ -3,27 +3,55 @@ import requests, json, os
 
 app = Flask(__name__)
 
-# Environment variables (Render-ზე დააყენე)
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "2112686712"))
+LODGY_API_KEY = os.getenv("LODGY_API_KEY")  # Lodgify API key
 
-@app.route("/")
-def home():
-    return "Hello from Lodgify → Monday Sync!"
 
-@app.route("/lodgify-webhook", methods=["POST"])
-def lodgify_webhook():
-    payload = request.json or {}
+# === Helpers ===
+def find_existing_item(booking_id):
+    """ამოწმებს Monday-ში არსებობს თუ არა ეს booking_id"""
+    query = """
+    query ($board: Int!) {
+      boards(ids: [$board]) {
+        items_page {
+          items {
+            id
+            column_values {
+              id
+              text
+            }
+          }
+        }
+      }
+    }
+    """
+    resp = requests.post(
+        "https://api.monday.com/v2",
+        headers={"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"},
+        json={"query": query, "variables": {"board": BOARD_ID}}
+    )
+    data = resp.json()
+    try:
+        items = data["data"]["boards"][0]["items_page"]["items"]
+        for it in items:
+            for col in it["column_values"]:
+                if col["id"] == "booking_id" and col["text"] == str(booking_id):
+                    return it["id"]
+    except Exception:
+        pass
+    return None
 
-    # Lodgify JSON-დან ძირითადი ველები
-    booking_id = payload.get("id")
-    guest = payload.get("guest", {}).get("name", "N/A")
-    email = payload.get("guest", {}).get("email", "")
-    check_in = payload.get("check_in_date")
-    check_out = payload.get("check_out_date")
-    property_name = payload.get("property", {}).get("name", "N/A")
 
-    # Column values (შესაბამისი სვეტების ID-ებით, რომლებსაც უკვე შექმენი Monday-ზე)
+def upsert_booking(booking):
+    """თუ booking არსებობს → update, თუ არა → create"""
+    booking_id = booking.get("id")
+    guest = booking.get("guest", {}).get("name", "N/A")
+    email = booking.get("guest", {}).get("email", "")
+    check_in = booking.get("check_in_date")
+    check_out = booking.get("check_out_date")
+    property_name = booking.get("property", {}).get("name", "N/A")
+
     colvals = {
         "booking_id": {"text": str(booking_id)},
         "guest": {"text": guest},
@@ -33,29 +61,64 @@ def lodgify_webhook():
         "property": {"text": property_name}
     }
 
-    # GraphQL მუტაცია
-    mutation = """
-    mutation ($board: Int!, $item: String!, $colvals: JSON!) {
-      create_item(board_id: $board, item_name: $item, column_values: $colvals) {
-        id
-      }
-    }
-    """
+    existing = find_existing_item(booking_id)
 
-    variables = {
-        "board": BOARD_ID,
-        "item": f"Booking {booking_id}",
-        "colvals": json.dumps(colvals)
-    }
+    if existing:
+        mutation = """
+        mutation ($item: Int!, $colvals: JSON!) {
+          change_multiple_column_values(item_id: $item, board_id: %d, column_values: $colvals) {
+            id
+          }
+        }
+        """ % BOARD_ID
 
-    response = requests.post(
+        variables = {"item": int(existing), "colvals": json.dumps(colvals)}
+    else:
+        mutation = """
+        mutation ($board: Int!, $item: String!, $colvals: JSON!) {
+          create_item(board_id: $board, item_name: $item, column_values: $colvals) {
+            id
+          }
+        }
+        """
+        variables = {"board": BOARD_ID, "item": f"Booking {booking_id}", "colvals": json.dumps(colvals)}
+
+    r = requests.post(
         "https://api.monday.com/v2",
         headers={"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"},
         json={"query": mutation, "variables": variables}
     )
+    return r.json()
 
-    return jsonify({
-        "status": "ok",
-        "booking_id": booking_id,
-        "monday_response": response.json()
-    })
+
+@app.route("/")
+def home():
+    return "Hello from Lodgify → Monday Sync!"
+
+
+# === Webhook: ახალი ან განახლებული booking ===
+@app.route("/lodgify-webhook", methods=["POST"])
+def lodgify_webhook():
+    payload = request.json or {}
+    result = upsert_booking(payload)
+    return jsonify({"status": "ok", "monday_response": result})
+
+
+# === One-time sync: ყველა არსებული booking Lodgify-დან ===
+@app.route("/lodgify-sync-all", methods=["GET"])
+def lodgify_sync_all():
+    url = "https://api.lodgify.com/v2/bookings"
+    headers = {"X-ApiKey": LODGY_API_KEY}
+    resp = requests.get(url, headers=headers)
+
+    if resp.status_code != 200:
+        return jsonify({"error": f"Lodgify API error {resp.status_code}", "text": resp.text}), 500
+
+    bookings = resp.json()
+    results = []
+
+    for b in bookings:
+        results.append(upsert_booking(b))
+
+    return jsonify({"status": "done", "count": len(results), "details": results})
+
