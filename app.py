@@ -11,15 +11,10 @@ LODGY_API_KEY = os.getenv("LODGY_API_KEY")
 LODGY_HEADERS = {"X-ApiKey": LODGY_API_KEY}
 MONDAY_HEADERS = {"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"}
 
-# Cache column id map in-memory
-COLUMN_ID_MAP = None
+COLUMN_ID_MAP = None  # cache
 
-# ---------- Lodgify helpers ----------
+# ---------- Lodgify ----------
 def fetch_lodgify_bookings():
-    """
-    Lodgify v2 bookings endpoint returns:
-    { "count": null|number, "items": [ { id, arrival, departure, property:{name}, guest:{name,email}, ... }, ... ] }
-    """
     url = "https://api.lodgify.com/v2/reservations/bookings"
     r = requests.get(url, headers=LODGY_HEADERS, timeout=30)
     if r.status_code != 200:
@@ -32,33 +27,30 @@ def fetch_lodgify_bookings():
         return []
     return data.get("items", [])
 
-
 def extract_booking_fields(b):
-    """
-    Normalize Lodgify booking object into fields expected by Monday.
-    Be conservative: if some field missing, return empty-safe values.
-    """
     bid = b.get("id") or b.get("bookingId")
     guest_name = (b.get("guest") or {}).get("name") or "N/A"
     guest_email = (b.get("guest") or {}).get("email") or ""
     check_in = b.get("arrival") or b.get("check_in_date") or ""
     check_out = b.get("departure") or b.get("check_out_date") or ""
     prop_name = ""
-    prop = b.get("property")
-    if isinstance(prop, dict):
-        prop_name = prop.get("name") or ""
+    if isinstance(b.get("property"), dict):
+        prop_name = b["property"].get("name") or ""
     return {
         "booking_id": str(bid) if bid is not None else "",
         "guest": guest_name,
         "email": guest_email,
-        "check_in": check_in,     # YYYY-MM-DD
-        "check_out": check_out,   # YYYY-MM-DD
-        "property": prop_name
+        "check_in": check_in,
+        "check_out": check_out,
+        "property": prop_name,
     }
 
-# ---------- Monday helpers ----------
+# ---------- Monday ----------
 def monday_graphql(query: str, variables: dict):
-    r = requests.post("https://api.monday.com/v2", headers=MONDAY_HEADERS, json={"query": query, "variables": variables}, timeout=60)
+    r = requests.post("https://api.monday.com/v2",
+                      headers=MONDAY_HEADERS,
+                      json={"query": query, "variables": variables},
+                      timeout=60)
     try:
         return r.json()
     except Exception:
@@ -70,27 +62,18 @@ def get_board_columns():
       boards(ids: $board) {
         id
         name
-        columns {
-          id
-          title
-          type
-        }
+        columns { id title type }
       }
     }
     """
     resp = monday_graphql(q, {"board": [BOARD_ID]})
-    cols = []
     try:
-        cols = resp["data"]["boards"][0]["columns"]
+        return resp["data"]["boards"][0]["columns"]
     except Exception:
         app.logger.error(f"Cannot read board columns. Response: {resp}")
-    return cols
+        return []
 
 def ensure_columns_and_get_map():
-    """
-    Ensure board has required columns; create missing ones.
-    Return dict: logical_key -> column_id
-    """
     global COLUMN_ID_MAP
     if COLUMN_ID_MAP:
         return COLUMN_ID_MAP
@@ -106,54 +89,40 @@ def ensure_columns_and_get_map():
 
     cols = get_board_columns()
 
-    def find_col_id_by_title_or_id(wanted_title, wanted_id_guess=None):
-        # 1) exact id match
-        if wanted_id_guess:
-            for c in cols:
-                if c["id"] == wanted_id_guess:
-                    return c["id"]
-        # 2) title case-insensitive match
+    def find_col_id_by_title_or_id(wanted_title):
         low = wanted_title.strip().lower()
         for c in cols:
             if (c.get("title") or "").strip().lower() == low:
                 return c["id"]
         return None
 
-    # Try to map existing by title or our previous ids (if already exist with same id)
     id_map = {}
     for r in required:
-        cid = find_col_id_by_title_or_id(r["title"], r.get("key"))  # try id==key fallback
+        cid = find_col_id_by_title_or_id(r["title"])
         if cid:
             id_map[r["key"]] = cid
-        else:
-            # Create missing column
-            create_q = """
-            mutation($board: ID!, $title: String!, $ctype: ColumnType!) {
-              create_column(board_id: $board, title: $title, column_type: $ctype) {
-                id
-              }
-            }
-            """
-            resp = monday_graphql(create_q, {"board": BOARD_ID, "title": r["title"], "ctype": r["type"]})
-            try:
-                new_id = resp["data"]["create_column"]["id"]
-                id_map[r["key"]] = new_id
-                # refresh local columns cache
-                cols.append({"id": new_id, "title": r["title"], "type": r["type"]})
-            except Exception:
-                app.logger.error(f"Failed to create column '{r['title']}' ({r['type']}), resp={resp}")
-                # If create failed, last resort: use the logical key, but mutations will likely fail.
-                id_map[r["key"]] = r["key"]
+            continue
+
+        create_q = """
+        mutation($board: ID!, $title: String!, $ctype: ColumnType!) {
+          create_column(board_id: $board, title: $title, column_type: $ctype) { id }
+        }
+        """
+        # Monday GraphQL enums as variables: passing lower-case strings works in practice
+        resp = monday_graphql(create_q, {"board": BOARD_ID, "title": r["title"], "ctype": r["type"]})
+        try:
+            new_id = resp["data"]["create_column"]["id"]
+            id_map[r["key"]] = new_id
+            cols.append({"id": new_id, "title": r["title"], "type": r["type"]})
+        except Exception:
+            app.logger.error(f"Failed to create column '{r['title']}' ({r['type']}), resp={resp}")
+            id_map[r["key"]] = r["title"]  # fallback, but likely to fail on mutation
 
     COLUMN_ID_MAP = id_map
-    app.logger.info(f"Column map resolved: {COLUMN_ID_MAP}")
+    app.logger.info(f"Column map: {COLUMN_ID_MAP}")
     return COLUMN_ID_MAP
 
 def find_item_by_booking_id(booking_id: str):
-    """
-    Scan first 500 items and match column 'Booking ID' text to booking_id.
-    (Simple & robust without advanced filters.)
-    """
     q = """
     query($board: [ID!]!) {
       boards(ids: $board) {
@@ -170,53 +139,51 @@ def find_item_by_booking_id(booking_id: str):
     try:
         items = resp["data"]["boards"][0]["items_page"]["items"]
     except Exception:
-        app.logger.error(f"find_item_by_booking_id: bad response {resp}")
+        app.logger.error(f"find_item_by_booking_id bad response: {resp}")
         return None
 
-    colmap = ensure_columns_and_get_map()
-    bid_col_id = colmap["booking_id"]
-
+    bid_col = ensure_columns_and_get_map()["booking_id"]
     for it in items:
         for cv in it.get("column_values", []):
-            if cv.get("id") == bid_col_id and (cv.get("text") or "") == booking_id:
+            if cv.get("id") == bid_col and (cv.get("text") or "") == booking_id:
                 return int(it["id"])
     return None
 
 def build_column_values(fields: dict):
     """
-    Convert normalized fields -> Monday column JSON, using discovered column IDs.
-    Remove empty values to avoid Monday validation errors.
+    IMPORTANT:
+    - text columns => value is a plain string
+    - email column => {"email": "...", "text": "..."}
+    - date column  => {"date": "YYYY-MM-DD"}
     """
-    colmap = ensure_columns_and_get_map()
+    cmap = ensure_columns_and_get_map()
     colvals = {}
 
-    def add_text(key, val):
-        if val is not None and str(val).strip() != "":
-            colvals[colmap[key]] = {"text": str(val)}
-
-    def add_date(key, val):
+    def set_text(key, val):
         v = (val or "").strip()
         if v:
-            colvals[colmap[key]] = {"date": v}
+            colvals[cmap[key]] = v  # <-- plain string for text columns
 
-    def add_email(key, val):
+    def set_date(key, val):
         v = (val or "").strip()
         if v:
-            colvals[colmap[key]] = {"email": v, "text": v}
+            colvals[cmap[key]] = {"date": v}
 
-    add_text("booking_id", fields.get("booking_id"))
-    add_text("guest",      fields.get("guest"))
-    add_email("email",     fields.get("email"))
-    add_date("check_in",   fields.get("check_in"))
-    add_date("check_out",  fields.get("check_out"))
-    add_text("property",   fields.get("property"))
+    def set_email(key, val):
+        v = (val or "").strip()
+        if v:
+            colvals[cmap[key]] = {"email": v, "text": v}
+
+    set_text("booking_id", fields.get("booking_id"))
+    set_text("guest",      fields.get("guest"))
+    set_email("email",     fields.get("email"))
+    set_date("check_in",   fields.get("check_in"))
+    set_date("check_out",  fields.get("check_out"))
+    set_text("property",   fields.get("property"))
 
     return colvals
 
 def upsert_to_monday(fields: dict):
-    """
-    If item with same Booking ID exists -> update, else create.
-    """
     booking_id = fields.get("booking_id") or ""
     if not booking_id:
         return {"errors": [{"message": "missing booking_id"}]}
@@ -225,28 +192,20 @@ def upsert_to_monday(fields: dict):
     colvals = build_column_values(fields)
 
     if item_id:
-        # Update
         q = """
         mutation($item: ID!, $board: ID!, $vals: JSON!) {
-          change_multiple_column_values(item_id: $item, board_id: $board, column_values: $vals) {
-            id
-          }
+          change_multiple_column_values(item_id: $item, board_id: $board, column_values: $vals) { id }
         }
         """
-        resp = monday_graphql(q, {"item": item_id, "board": BOARD_ID, "vals": json.dumps(colvals)})
-        return resp
-    else:
-        # Create
-        q = """
-        mutation($board: ID!, $name: String!, $vals: JSON!) {
-          create_item(board_id: $board, item_name: $name, column_values: $vals) {
-            id
-          }
-        }
-        """
-        name = f"Booking {booking_id}"
-        resp = monday_graphql(q, {"board": BOARD_ID, "name": name, "vals": json.dumps(colvals)})
-        return resp
+        return monday_graphql(q, {"item": item_id, "board": BOARD_ID, "vals": json.dumps(colvals)})
+
+    q = """
+    mutation($board: ID!, $name: String!, $vals: JSON!) {
+      create_item(board_id: $board, item_name: $name, column_values: $vals) { id }
+    }
+    """
+    name = f"Booking {booking_id}"
+    return monday_graphql(q, {"board": BOARD_ID, "name": name, "vals": json.dumps(colvals)})
 
 # ---------- Routes ----------
 @app.route("/")
@@ -257,21 +216,14 @@ def home():
 def health():
     return jsonify({"ok": True})
 
-@app.route("/columns", methods=["GET"])
+@app.route("/columns")
 def columns():
-    """
-    Inspect board columns + show resolved mapping.
-    Useful for debugging wrong column IDs.
-    """
     cols = get_board_columns()
     cmap = ensure_columns_and_get_map()
     return jsonify({"board_id": BOARD_ID, "columns": cols, "mapping": cmap})
 
 @app.route("/lodgify-webhook", methods=["POST"])
 def lodgify_webhook():
-    """
-    Accept one booking payload from Lodgify webhook and upsert to Monday.
-    """
     b = request.json or {}
     fields = extract_booking_fields(b)
     app.logger.info(f"Webhook upsert BookingID={fields.get('booking_id')}")
@@ -280,10 +232,7 @@ def lodgify_webhook():
 
 @app.route("/lodgify-sync-all", methods=["GET"])
 def lodgify_sync_all():
-    """
-    One-time sync of existing bookings.
-    Optional query param: ?limit=5 (default 5 to avoid timeouts on free Render).
-    """
+    # safe default limit on free Render
     try:
         limit = int(request.args.get("limit", "5"))
         if limit <= 0:
@@ -299,6 +248,8 @@ def lodgify_sync_all():
         fields = extract_booking_fields(b)
         resp = upsert_to_monday(fields)
         processed.append({"fields": fields, "monday": resp})
-        app.logger.info(f"Synced booking {fields.get('booking_id')} ({fields.get('check_in')}→{fields.get('check_out')})")
+        app.logger.info(
+            f"Synced booking {fields.get('booking_id')} ({fields.get('check_in')}→{fields.get('check_out')})"
+        )
 
     return jsonify({"status": "done", "processed": len(processed), "limit": limit, "sample": processed})
