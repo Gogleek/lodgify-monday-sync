@@ -15,7 +15,7 @@ logging.basicConfig(level=level, handlers=[handler, logging.StreamHandler()])
 log = logging.getLogger("lodgify-monday")
 
 # -----------------------
-# Helpers / Config Maps
+# Helpers
 # -----------------------
 E164_RE = re.compile(r"^\+?[1-9]\d{6,14}$")
 
@@ -32,38 +32,10 @@ def normalize_phone(raw: str) -> str:
     digits = re.sub(r"\D", "", s)
     return digits[-12:] if digits else ""
 
-# Logical key → Monday column_id mapping (დაარეგულირე შენს ბორდზე)
-COLUMN_MAP = {
-    "reservation_id": "reservation_id",  # Text column (lookup)
-    "unit": "text_unit",
-    "email": "email",
-    "phone": "phone",
-    "check_in": "check_in",
-    "check_out": "check_out",
-    "total": "total",
-    "currency": "currency",
-    "status": "status_dropdown",         # Dropdown
-    "assignee": "assignee",              # People
-}
-
-DROPDOWN_LABELS = {
-    "status": {
-        "confirmed": "Confirmed",
-        "booked": "Confirmed",           # Lodgify v2 "Booked"
-        "paid": "Paid",
-        "pending": "Pending",
-        "cancelled": "Cancelled",
-        "canceled": "Cancelled",
-        "default": "Pending",
-    }
-}
-
 def to_date(v):
     if not v:
         return None
-    # allow dicts like {"time": null, ...}
     if isinstance(v, dict):
-        # best-effort: try v.get("time") or return None
         v = v.get("time") or None
         if not v:
             return None
@@ -75,8 +47,44 @@ def to_date(v):
         except Exception:
             return None
 
+# -----------------------
+# COLUMN MAP (შენი რეალური IDs)
+# -----------------------
+COLUMN_MAP = {
+    "reservation_id": "text_mkv47vb1",    # Text (lookup) — Reservation ID
+    "unit":           "text_mkv49eqm",    # Text — Unit
+    "email":          "email_mkv4mbte",   # Email
+    "phone":          "phone_mkv4yk8k",   # Phone
+    "check_in":       "date_mkv4npgx",    # Date — Check-in
+    "check_out":      "date_mkv46w1t",    # Date — Check-out
+    "total":          "numeric_mkv4n3qy", # Numbers — Total amount
+    "currency":       "text_mkv497t1",    # Text — Currency code (e.g., GBP)
+    "status":         "color_mkv4zrs6",   # Status column (GraphQL type: color), expects {"label": "..."}
+    # "assignee":     (არ ვიყენებთ)
+}
+
+# სურვილისამებრ: დაამატე სხვა სვეტები აქ (key = ლოგიკური სახელი → value = Monday column_id)
+# და ქვემოთ map_booking_to_monday() ში ჩაამატე შესაბამისი put(...).
+EXTRA_COLUMNS: Dict[str, str] = {
+    # "nights": "numeric_XXXX",         # მაგალითი
+    # "channel": "text_YYYY",
+    # "notes": "long_text_ZZZZ",
+}
+
+DROPDOWN_LABELS = {
+    "status": {
+        "confirmed": "Confirmed",
+        "booked": "Confirmed",      # Lodgify v2 "Booked"
+        "paid": "Paid",
+        "pending": "Pending",
+        "cancelled": "Cancelled",
+        "canceled": "Cancelled",
+        "default": "Pending",
+    }
+}
+
 def put(cv: dict, logical_key: str, value):
-    col_id = COLUMN_MAP.get(logical_key)
+    col_id = COLUMN_MAP.get(logical_key) or EXTRA_COLUMNS.get(logical_key)
     if col_id is not None and value is not None:
         cv[col_id] = value
 
@@ -88,20 +96,18 @@ class LodgifyClient:
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.session = requests.Session()
-        # ვხმარობთ X-ApiKey ჰედერს (არა Bearer-ს)
         self.session.headers.update({
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "X-ApiKey": self.api_key,
+            "X-ApiKey": self.api_key,  # Lodgify auth
         })
 
     def list_bookings(self, limit: int = 50, skip: int = 0) -> List[dict]:
         url = f"{self.api_base}/v2/reservations/bookings"
-        # სცენარი A: take/skip
         params = {"take": max(1, int(limit)), "skip": max(0, int(skip))}
         resp = self.session.get(url, params=params, timeout=45)
 
-        # fallback სცენარი: page/pageSize
+        # fallback: page/pageSize
         if resp.status_code in (400, 404):
             page_size = max(1, int(limit))
             page_number = max(1, (int(skip) // page_size) + 1)
@@ -163,8 +169,23 @@ class MondayClient:
             raise RuntimeError(f"Monday GQL error: {out['errors']}")
         return out.get("data", {})
 
+    def get_board_columns(self) -> list:
+        query = """
+        query($board_id: [ID!]) {
+          boards(ids: $board_id) {
+            id
+            name
+            columns { id title type }
+          }
+        }
+        """
+        data = self._gql(query, {"board_id": [str(self.board_id)]})
+        boards = (data or {}).get("boards") or []
+        if not boards:
+            return []
+        return boards[0].get("columns") or []
+
     def find_item_by_external_id(self, column_id: str, external_id: str) -> Optional[int]:
-        # ID! ტიპებზე გადავიყვანეთ
         query = """
         query($board_id: ID!, $column_id: String!, $value: String!) {
           items_page_by_column_values(
@@ -201,17 +222,27 @@ class MondayClient:
         external_id = mapped["external_id"]
         column_values = mapped["column_values"]
 
-        lookup_col = COLUMN_MAP["reservation_id"]  # აუცილებელია ეს სვეტი არსებობდეს ბორდზე
+        lookup_col = COLUMN_MAP["reservation_id"]
         try:
-            existing_id = self.find_item_by_external_id(lookup_col, external_id)
+            existing_id = None
+            try:
+                existing_id = self.find_item_by_external_id(lookup_col, external_id)
+            except Exception as inner_e:
+                if "Column not found" in str(inner_e) or "missing_column" in str(inner_e):
+                    log.warning("Lookup column '%s' not found on board %s. Proceeding with create.", lookup_col, self.board_id)
+                else:
+                    raise
+
             if existing_id:
                 self.update_item(existing_id, column_values)
                 log.info("Updated Monday item id=%s (ext=%s)", existing_id, external_id)
                 return UpsertResult(ok=True, item_id=existing_id, created=False, updated=True)
             else:
-                new_id = self.create_item(item_name, column_values)
+                safe_name = f"{item_name} • #{external_id}"
+                new_id = self.create_item(safe_name, column_values)
                 log.info("Created Monday item id=%s (ext=%s)", new_id, external_id)
                 return UpsertResult(ok=True, item_id=new_id, created=True, updated=False)
+
         except Exception as e:
             log.exception("Upsert failed for external_id=%s", external_id)
             return UpsertResult(ok=False, error=str(e))
@@ -220,14 +251,11 @@ class MondayClient:
 # Mapping
 # -----------------------
 def map_booking_to_monday(bk: dict) -> dict:
-    # Lodgify v2 sample keys: guest.name, arrival, departure, currency_code, total_amount
     guest = bk.get("guest") or {}
-    # name შეიძლება იყოს "First Last"
     full_name = (guest.get("name") or "").strip()
     first_name = (guest.get("first_name") or "").strip()
     last_name = (guest.get("last_name") or "").strip()
     if not (first_name or last_name):
-        # სცადე full_name-ის გაყოფა
         if full_name:
             parts = full_name.split()
             if len(parts) == 1:
@@ -235,26 +263,21 @@ def map_booking_to_monday(bk: dict) -> dict:
             else:
                 first_name = " ".join(parts[:-1])
                 last_name = parts[-1]
+
     phone = normalize_phone(guest.get("phone") or guest.get("mobile") or "")
     email = guest.get("email") or ""
 
     res_id = str(bk.get("id") or bk.get("booking_id") or bk.get("code") or "")
     unit_name = (bk.get("rental") or {}).get("name") or bk.get("unit_name") or "Unknown unit"
-    status = (bk.get("status") or "").lower()
+    status_raw = (bk.get("status") or "").lower()
+    status_label = DROPDOWN_LABELS.get("status", {}).get(status_raw, DROPDOWN_LABELS["status"]["default"])
 
-    status_label = DROPDOWN_LABELS.get("status", {}).get(
-        status,
-        DROPDOWN_LABELS["status"].get("default", "Pending")
-    )
-
-    # Prefer v2 fields
     check_in_raw = bk.get("arrival") or bk.get("check_in")
     check_out_raw = bk.get("departure") or bk.get("check_out")
     check_in = to_date(check_in_raw)
     check_out = to_date(check_out_raw)
 
     total_price = bk.get("total_amount") or bk.get("total") or bk.get("price_total") or 0
-    # ყურადღება: თუ ვალუტა არ მოიძებნა, ნაგულისხმევად იქნება "GBP". საჭიროების შემთხვევაში შეცვალეთ.
     currency = bk.get("currency_code") or bk.get("currency") or "GBP"
 
     display_name = (f"{first_name} {last_name}".strip() or full_name) or f"Booking {res_id}"
@@ -268,16 +291,11 @@ def map_booking_to_monday(bk: dict) -> dict:
     put(cv, "check_out", {"date": check_out})
     put(cv, "total", total_price)
     put(cv, "currency", currency)
-    put(cv, "status", {"labels": [status_label]})
+    # Status column (type=color) — მონადიში ფორმატი არის {"label": "..."}
+    put(cv, "status", {"label": status_label})
 
-    # --- [შესწორება] ---
-    # ქვემოთ მოცემული ლოგიკა იწვევდა შეცდომას, რადგან Monday.com-ის "People" სვეტი
-    # `id`-ში ელოდება მომხმარებლის ციფრულ ID-ს და არა ელფოსტას.
-    # ამ ფუნქციონალის სწორად ასამუშავებლად საჭიროა დამატებითი ლოგიკა,
-    # რომელიც ელფოსტით მოძებნის მომხმარებლის ID-ს Monday-ს ბაზაში.
-    #
-    # if email:
-    #     cv[COLUMN_MAP["assignee"]] = {"personsAndTeams": [{"id": email, "kind": "person"}]}
+    # აქ შეიძლება დაამატო EXTRA_COLUMNS ლოგიკაც, напр.:
+    # put(cv, "nights", bk.get("nights"))
 
     return {"item_name": display_name, "external_id": res_id, "column_values": cv}
 
@@ -289,9 +307,6 @@ LODGY_API_KEY  = os.getenv("LODGY_API_KEY", "")
 MONDAY_API_BASE = os.getenv("MONDAY_API_BASE", "https://api.monday.com/v2")
 MONDAY_API_KEY  = os.getenv("MONDAY_API_KEY", "")
 
-# --- [შესწორება] ---
-# დავამატეთ try-except ბლოკი, რათა აპლიკაცია არ გაითიშოს,
-# თუ MONDAY_BOARD_ID ცვლადი არასწორად არის მითითებული.
 try:
     MONDAY_BOARD_ID = int(os.getenv("MONDAY_BOARD_ID", "0"))
 except (ValueError, TypeError):
@@ -307,7 +322,16 @@ def health():
 
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "endpoints": ["/health", "/lodgify-sync-all", "/webhook/lodgify"]}), 200
+    return jsonify({"ok": True, "endpoints": ["/health", "/lodgify-sync-all", "/webhook/lodgify", "/diag/monday-columns"]}), 200
+
+@app.get("/diag/monday-columns")
+def diag_monday_columns():
+    try:
+        cols = monday.get_board_columns()
+        slim = [{"id": c["id"], "title": c["title"], "type": c["type"]} for c in cols]
+        return jsonify({"ok": True, "board_id": MONDAY_BOARD_ID, "columns": slim}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/webhook/lodgify")
 def webhook_lodgify():
