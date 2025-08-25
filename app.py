@@ -1,7 +1,7 @@
 import os, json, logging, re, requests
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 from datetime import datetime, timezone, date, timedelta
 from flask import Flask, request, jsonify
 
@@ -23,8 +23,7 @@ ONLY_DIGITS_OR_PIPES = re.compile(r"^[\d| ]+$")
 def normalize_phone(raw: str) -> str:
     if not raw:
         return ""
-    s = str(raw)
-    s = s.replace("(0)", "")
+    s = str(raw).replace("(0)", "")
     s = re.sub(r"[\s\-().]", "", s)
     if s.startswith("00"):
         s = "+" + s[2:]
@@ -75,42 +74,40 @@ def today_date():
 # COLUMN MAP ( შენი IDs )
 # -----------------------
 COLUMN_MAP = {
-    "reservation_id": "text_mkv47vb1",     # Booking ID (Text) — lookup key
-    "unit":           "text_mkv49eqm",     # Property/Unit (Text)
-    "property_id":    "text_mkv4n35j",     # Property ID (Text)
-    "guest_name":     "text_mkv46pev",     # Guest (Text)
-    "email":          "email_mkv4mbte",    # Email
-    "phone":          "phone_mkv4yk8k",    # Phone
-    "check_in":       "date_mkv4npgx",     # Check-in (Date)
-    "check_out":      "date_mkv46w1t",     # Check-out (Date)
-    "nights":         "numeric_mkv4j5aq",  # Nights (Numbers)
-    "source":         "dropdown_mkv47kzc", # Source (Dropdown)
-    "status":         "color_mkv4zrs6",    # Status (Status/color) -> Completed/Confirmed/Paid/Pending/Cancelled
-    "op_status":      "color_mkv4v5f0",    # Operational status (Upcoming/In house/Completed) — Optional
-    "last_sync":      "date_mkv44erw",     # Last Sync (Date)
-    "raw_json":       "long_text_mkv4y19w",# Raw JSON (Long text)
-    "booking_status": "text_mkv4kjxs",     # Booking Status (Text)
-    "currency":       "text_mkv497t1",     # Currency (Text)
-    "total":          "numeric_mkv4n3qy",  # Total Amount (Numbers)
-    "amount_paid":    "numeric_mkv43src",  # Amount Paid (Numbers)
-    "amount_due":     "numeric_mkv4zk73",  # Amount Due (Numbers)
-    "source_text":    "long_text_mkv435cw",# Source Text (Long text)
-    "language":       "text_mkv41dhj",     # Language (Text)
-    "adults":         "numeric_mkv4nhza",  # Adults (Numbers)
-    "children":       "numeric_mkv4dq38",  # Children (Numbers)
-    "infants":        "numeric_mkv4ez6r",  # Infants (Numbers)
-    "pets":           "numeric_mkv49d8e",  # Pets (Numbers)
-    "people":         "numeric_mkv4z385",  # People (Numbers)
-    "key_code":       "text_mkv4ae9w",     # Key Code (Text)
-    "thread_uid":     "text_mkv49b55",     # Thread UID (Text)
-    "created_at":     "date_mkv4bkr9",     # Created At (Date)
-    "updated_at":     "date_mkv4n357",     # Updated At (Date)
-    "canceled_at":    "date_mkv4hw1d",     # Canceled At (Date)
+    "reservation_id": "text_mkv47vb1",     # Booking ID — lookup
+    "unit":           "text_mkv49eqm",     # Property/Unit
+    "property_id":    "text_mkv4n35j",     # Property ID
+    "guest_name":     "text_mkv46pev",
+    "email":          "email_mkv4mbte",
+    "phone":          "phone_mkv4yk8k",
+    "check_in":       "date_mkv4npgx",
+    "check_out":      "date_mkv46w1t",
+    "nights":         "numeric_mkv4j5aq",
+    "source":         "dropdown_mkv47kzc", # Booking.com / Airbnb / Expedia / Vrbo
+    "status":         "color_mkv4zrs6",    # Completed / Confirmed / Paid / Pending / Cancelled
+    "op_status":      "color_mkv4v5f0",    # Upcoming / In house / Completed (არ არის კრიტიკული; თუ არ არსებობს, ვიგნორებთ)
+    "last_sync":      "date_mkv44erw",
+    "raw_json":       "long_text_mkv4y19w",
+    # "booking_status": "text_mkv4kjxs",   # ეს ბევრ ბორდზე არ გაქვს; აღარ ვგზავნით, თორემ მთელ რიქვესთს აგდებს
+    "currency":       "text_mkv497t1",
+    "total":          "numeric_mkv4n3qy",
+    "amount_paid":    "numeric_mkv43src",
+    "amount_due":     "numeric_mkv4zk73",
+    "source_text":    "long_text_mkv435cw",
+    "language":       "text_mkv41dhj",
+    "adults":         "numeric_mkv4nhza",
+    "children":       "numeric_mkv4dq38",
+    "infants":        "numeric_mkv4ez6r",
+    "pets":           "numeric_mkv49d8e",
+    "people":         "numeric_mkv4z385",
+    "key_code":       "text_mkv4ae9w",
+    "thread_uid":     "text_mkv49b55",
+    "created_at":     "date_mkv4bkr9",
+    "updated_at":     "date_mkv4n357",
+    "canceled_at":    "date_mkv4hw1d",
 }
 
-# Label maps
-# Monday-ს სვეტში შენ გაქვს ზუსტად ეს ლეიბლები:
-# Completed / Confirmed / Paid / Pending / Cancelled
+# ზუსტად შენი ლეიბლები
 STATUS_LABELS_EXACT = {
     "confirmed": "Confirmed",
     "booked":    "Confirmed",
@@ -126,7 +123,6 @@ SOURCE_LABELS = {
     "airbnb": "Airbnb",
     "expedia": "Expedia",
     "vrbo": "Vrbo",
-    # "manual" შეგნებულად არ ვამეპინგებთ — ბევრ ბორდზე ეს ლეიბლი ვერააქვს და ერორს აგდებს
 }
 
 def put(cv: dict, logical_key: str, value):
@@ -135,19 +131,16 @@ def put(cv: dict, logical_key: str, value):
         cv[col_id] = value
 
 # -----------------------
-# HTTP logging shim (optional)
+# HTTP shim for debug
 # -----------------------
 _original_request = requests.sessions.Session.request
 def _request(self, method, url, **kwargs):
-    try:
-        log.debug("[HTTP] %s %s", method, url)
-        return _original_request(self, method, url, **kwargs)
-    except Exception:
-        raise
+    log.debug("[HTTP] %s %s", method, url)
+    return _original_request(self, method, url, **kwargs)
 requests.sessions.Session.request = _request
 
 # -----------------------
-# Lodgify Client (v2)
+# Lodgify Client
 # -----------------------
 class LodgifyClient:
     def __init__(self, api_base: str, api_key: str):
@@ -159,14 +152,14 @@ class LodgifyClient:
             "Content-Type": "application/json",
             "X-ApiKey": self.api_key,
         })
+        self._rental_name_cache: Dict[str, str] = {}
 
     def list_bookings(self, limit: int = 50, skip: int = 0) -> List[dict]:
         url = f"{self.api_base}/v2/reservations/bookings"
         params = {"take": max(1, int(limit)), "skip": max(0, int(skip))}
-        log.info("[Lodgify %s] GET %s params=%s", id(self) % 0xffff, url, params)
+        log.info("[Lodgify] GET %s params=%s", url, params)
         resp = self.session.get(url, params=params, timeout=45)
 
-        # fallback: page/pageSize style
         if resp.status_code in (400, 404):
             page_size = max(1, int(limit))
             page_number = max(1, (int(skip) // page_size) + 1)
@@ -182,8 +175,38 @@ class LodgifyClient:
             items = list(items.values())
         if not isinstance(items, list):
             items = []
-        log.info("[Lodgify %s] fetched %d item(s) (limit=%s, skip=%s)", id(self) % 0xffff, len(items), limit, skip)
+        log.info("[Lodgify] fetched %d items", len(items))
         return items
+
+    def get_rental_name(self, rental_id: Optional[str]) -> Optional[str]:
+        """სხვა ჩანაწერებზე რომვე გამოვიყენოთ, ქეშიც გვაქვს."""
+        if not rental_id:
+            return None
+        rid = str(rental_id)
+        if rid in self._rental_name_cache:
+            return self._rental_name_cache[rid]
+        # ვცდი რამდენიმე ვარიანტს; თუ ვერ ვნახე — ვაბრუნებ None-ს
+        candidates = [
+            f"{self.api_base}/v2/rentals/{rid}",
+            f"{self.api_base}/v2/properties/{rid}",
+        ]
+        for url in candidates:
+            try:
+                r = self.session.get(url, timeout=20)
+                if not r.ok:
+                    continue
+                data = r.json() or {}
+                name = None
+                if isinstance(data, dict):
+                    name = data.get("name") or data.get("title")
+                    if not name and "rental" in data and isinstance(data["rental"], dict):
+                        name = data["rental"].get("name") or data["rental"].get("title")
+                if name:
+                    self._rental_name_cache[rid] = name
+                    return name
+            except Exception:
+                continue
+        return None
 
 # -----------------------
 # Monday Client
@@ -205,9 +228,10 @@ class MondayClient:
         self.board_id = board_id
         self.session = requests.Session()
         self.session.headers.update({
-            "Authorization": self.api_key,  # raw token
+            "Authorization": self.api_key,
             "Content-Type": "application/json",
         })
+        self._column_ids: Optional[set] = None
 
     def _gql(self, query: str, variables: dict = None) -> dict:
         payload = {"query": query}
@@ -221,8 +245,30 @@ class MondayClient:
             raise RuntimeError(f"Monday GQL error: {out['errors']}")
         return out.get("data", {})
 
+    def _load_columns(self):
+        if self._column_ids is not None:
+            return
+        q = """
+        query($board_id: [ID!]) {
+          boards(ids: $board_id) {
+            columns { id }
+          }
+        }
+        """
+        data = self._gql(q, {"board_id": [str(self.board_id)]})
+        boards = (data or {}).get("boards") or []
+        cols = boards[0]["columns"] if boards else []
+        self._column_ids = {c["id"] for c in cols}
+        log.info("Monday board %s loaded %d columns", self.board_id, len(self._column_ids))
+
+    def _filter_cols(self, column_values: Dict[str, object]) -> Dict[str, object]:
+        self._load_columns()
+        if not self._column_ids:
+            return column_values
+        # დატოვე მხოლოდ არსებული column_id-ები
+        return {cid: val for cid, val in column_values.items() if cid in self._column_ids}
+
     def find_item_by_external_id(self, column_id: str, external_id: str) -> Optional[int]:
-        # მოძებნე აქტიური (არარქივირებული) აითემი ამ ბორდზე ამ სვეტის მნიშვნელობით
         query = """
         query($board_id: ID!, $column_id: String!, $value: String!) {
           items_page_by_column_values(
@@ -242,17 +288,18 @@ class MondayClient:
           create_item(board_id: $board_id, item_name: $name, column_values: $cols) { id }
         }
         """
-        data = self._gql(query, {"board_id": str(self.board_id), "name": item_name, "cols": json.dumps(column_values)})
+        cols = self._filter_cols(column_values)
+        data = self._gql(query, {"board_id": str(self.board_id), "name": item_name, "cols": json.dumps(cols)})
         return int(data["create_item"]["id"])
 
     def update_item(self, item_id: int, column_values: Dict[str, object]) -> int:
-        # board_id აუცილებელია, თორემ Monday აგდებს შეცდომას
         query = """
         mutation($board_id: ID!, $item_id: ID!, $cols: JSON!) {
           change_multiple_column_values(board_id: $board_id, item_id: $item_id, column_values: $cols) { id }
         }
         """
-        data = self._gql(query, {"board_id": str(self.board_id), "item_id": str(item_id), "cols": json.dumps(column_values)})
+        cols = self._filter_cols(column_values)
+        data = self._gql(query, {"board_id": str(self.board_id), "item_id": str(item_id), "cols": json.dumps(cols)})
         return int(data["change_multiple_column_values"]["id"])
 
     def upsert_item(self, mapped: dict) -> UpsertResult:
@@ -266,8 +313,8 @@ class MondayClient:
             try:
                 existing_id = self.find_item_by_external_id(lookup_col, external_id)
             except Exception as inner_e:
-                if "Column not found" in str(inner_e) or "missing_column" in str(inner_e):
-                    log.warning("Lookup column '%s' not found on board %s. Creating without lookup.", lookup_col, self.board_id)
+                if "missing_column" in str(inner_e) or "Column not found" in str(inner_e):
+                    log.warning("Lookup column '%s' missing on board %s. Creating without lookup.", lookup_col, self.board_id)
                 else:
                     raise
 
@@ -289,6 +336,7 @@ class MondayClient:
 # Mapping Lodgify → Monday
 # -----------------------
 BAD_RENTAL_NAMES = {"airbnbintegration", "direct after airbnb", "false", "false}"}
+RENTAL_NAME_CACHE: Dict[str, str] = {}  # property_id -> name (process cache)
 
 def label_for_source(raw: Optional[str]) -> Optional[str]:
     if not raw:
@@ -299,21 +347,31 @@ def label_for_source(raw: Optional[str]) -> Optional[str]:
             return v
     return None
 
-def extract_unit_name(bk: dict) -> Optional[str]:
-    """
-    პრიორიტეტი:
-    1) source_text-ის ბოლოს მყოფი ფრჩხილები:  "... (Queens 8)" -> Queens 8
-       - უნდა შეიცავდეს ასოებს; მხოლოდ ციფრები/pipe იგნორია
-    2) rental.name, თუ არ არის ნაგავი/ინტეგრაცია/ციფრები
-    """
-    st = (bk.get("source_text") or "").strip()
-    if st:
-        m = re.search(r"\(([^()]+)\)\s*$", st)
-        if m:
-            cand = m.group(1).strip()
-            if cand and not ONLY_DIGITS_OR_PIPES.match(cand) and cand.lower() not in BAD_RENTAL_NAMES:
-                return cand
+def extract_unit_from_source_text(st: str) -> Optional[str]:
+    if not st:
+        return None
+    # 1) ბოლო ფრჩხილები
+    m = re.search(r"\(([^()]+)\)\s*$", st)
+    if m:
+        cand = m.group(1).strip()
+        if cand and not ONLY_DIGITS_OR_PIPES.match(cand) and cand.lower() not in BAD_RENTAL_NAMES:
+            return cand
+    # 2) ბოლო დეფისის შემდეგი სიტყვები (მაგ: "... - B30")
+    m = re.search(r"-\s*([A-Za-z][A-Za-z0-9' /\-]+)\s*$", st)
+    if m:
+        cand = m.group(1).strip()
+        if cand and not ONLY_DIGITS_OR_PIPES.match(cand) and cand.lower() not in BAD_RENTAL_NAMES:
+            return cand
+    return None
 
+def extract_unit_name(bk: dict) -> Optional[str]:
+    # source_text
+    st = (bk.get("source_text") or "").strip()
+    cand = extract_unit_from_source_text(st)
+    if cand:
+        return cand
+
+    # rental.name
     rname = ((bk.get("rental") or {}).get("name") or "").strip()
     if rname:
         low = rname.lower()
@@ -323,7 +381,6 @@ def extract_unit_name(bk: dict) -> Optional[str]:
     return None
 
 def monday_main_status(bk: dict, check_in: Optional[str], check_out: Optional[str]) -> str:
-    # თუ უკვე გასულია check_out -> Completed
     try:
         if check_out:
             co = datetime.strptime(check_out, "%Y-%m-%d").date()
@@ -331,7 +388,6 @@ def monday_main_status(bk: dict, check_in: Optional[str], check_out: Optional[st
                 return "Completed"
     except Exception:
         pass
-
     raw = (bk.get("status") or "").lower().strip()
     return STATUS_LABELS_EXACT.get(raw, STATUS_DEFAULT)
 
@@ -343,7 +399,7 @@ def monday_operational_status(check_in: Optional[str], check_out: Optional[str],
         co = datetime.strptime(check_out, "%Y-%m-%d").date()
         td = today_date()
         if cancelled:
-            return "Completed" if co < td else None   # არ ვტოვებთ "In house"-ს თუ გაუქმებულია
+            return "Completed" if co < td else None
         if td < ci:
             return "Upcoming"
         if ci <= td <= co:
@@ -355,9 +411,9 @@ def monday_operational_status(check_in: Optional[str], check_out: Optional[str],
     return None
 
 def map_booking_to_monday(bk: dict) -> dict:
-    # identifiers & meta
     res_id = str(bk.get("id") or bk.get("booking_id") or bk.get("code") or "")
     property_id = bk.get("property_id") or (bk.get("rental") or {}).get("id")
+    pid_str = str(property_id) if property_id else None
 
     # guest
     guest = bk.get("guest") or {}
@@ -379,7 +435,7 @@ def map_booking_to_monday(bk: dict) -> dict:
     check_out = iso_date(bk.get("departure") or bk.get("check_out"))
     nights = days_between(check_in, check_out)
 
-    # amounts
+    # money
     total_amount = safe_float(bk.get("total_amount") or bk.get("total") or bk.get("price_total"))
     amount_paid = safe_float(bk.get("amount_paid"))
     amount_due  = safe_float(bk.get("amount_due"))
@@ -392,10 +448,24 @@ def map_booking_to_monday(bk: dict) -> dict:
     source_label = label_for_source(source_raw)
     cancelled_flag = (status_raw or "").lower().strip() in ("cancelled", "canceled")
 
-    # unit
-    unit_name = extract_unit_name(bk) or "Unknown unit"
+    # unit with multi-fallback and cross-cache
+    unit_name = extract_unit_name(bk)
+    if not unit_name and pid_str and pid_str in RENTAL_NAME_CACHE:
+        unit_name = RENTAL_NAME_CACHE[pid_str]
+    if not unit_name and pid_str:
+        # ბოლო ფოლბექი — ვცდი Lodgify-დან წამოღებას /v2/rentals/{id}
+        try:
+            rn = lodgify.get_rental_name(pid_str)
+            if rn and rn.lower() not in BAD_RENTAL_NAMES and not ONLY_DIGITS_OR_PIPES.match(rn):
+                unit_name = rn
+        except Exception:
+            pass
+    if unit_name and pid_str:
+        RENTAL_NAME_CACHE[pid_str] = unit_name
+    if not unit_name:
+        unit_name = "Unknown unit"
 
-    # rooms / people breakdown (best effort)
+    # rooms / people breakdown
     people = None; adults = children = infants = pets = None; key_code = None
     rooms = bk.get("rooms") or []
     if rooms:
@@ -403,7 +473,6 @@ def map_booking_to_monday(bk: dict) -> dict:
         gb = r0.get("guest_breakdown") or {}
         adults  = gb.get("adults");   children = gb.get("children")
         infants = gb.get("infants");  pets     = gb.get("pets")
-        # სულ ადამიანების რაოდენობა
         try:
             ppl = 0
             for k in (adults, children, infants, pets):
@@ -418,13 +487,11 @@ def map_booking_to_monday(bk: dict) -> dict:
     cv = {}
     put(cv, "reservation_id", res_id)
     put(cv, "unit", unit_name)
-    put(cv, "property_id", str(property_id) if property_id else None)
+    put(cv, "property_id", pid_str)
     put(cv, "guest_name", display_name)
 
     if email_raw:
         put(cv, "email", {"email": email_raw, "text": email_raw})
-    else:
-        put(cv, "email", None)
 
     put(cv, "phone", phone or None)
 
@@ -433,15 +500,13 @@ def map_booking_to_monday(bk: dict) -> dict:
     put(cv, "nights", nights)
 
     if source_label:
-        put(cv, "source", {"labels": [source_label]})  # dropdown
+        put(cv, "source", {"labels": [source_label]})
     else:
         put(cv, "source_text", source_raw or None)
 
-    # Main status with your exact labels
     main_status = monday_main_status(bk, check_in, check_out)
     put(cv, "status", {"label": main_status})
 
-    # Operational status (optional column)
     op_col = COLUMN_MAP.get("op_status")
     if op_col:
         op_val = monday_operational_status(check_in, check_out, cancelled_flag)
@@ -469,9 +534,8 @@ def map_booking_to_monday(bk: dict) -> dict:
     put(cv, "updated_at", {"date": iso_date(bk.get("updated_at"))})
     put(cv, "canceled_at", {"date": iso_date(bk.get("canceled_at"))})
 
-    put(cv, "booking_status", (status_raw or "").strip())
+    # booking_status COL ამოღებულია — ბევრ ბორდზე არ არსებობს და მთელ რიქვესთს აგდებს
 
-    # raw JSON snapshot (compact)
     try:
         raw_compact = json.dumps(bk, separators=(",", ":"), ensure_ascii=False)[:50000]
         put(cv, "raw_json", raw_compact)
@@ -502,7 +566,6 @@ def _unhandled(e):
 
 @app.get("/favicon.ico")
 def favicon():
-    # ძალით 204 — რომ ბრაუზერის ავტომატური ფავიკონი 500-ად არ ჩაიჭრას ლოგებში
     return ("", 204)
 
 @app.get("/health")
@@ -528,7 +591,7 @@ def diag_monday_columns():
           boards(ids: $board_id) {
             id
             name
-            columns { id title type settings_str }
+            columns { id title type }
           }
         }
         """
@@ -542,9 +605,6 @@ def diag_monday_columns():
 
 @app.post("/webhook/lodgify")
 def webhook_lodgify():
-    """
-    Lodgify webhook-ზე როცა მოდის ბუქინგი, ვაკეთებთ upsert-ს.
-    """
     payload = request.get_json(silent=True) or {}
     log.info("Webhook/Lodgify: %s", json.dumps(payload)[:2000])
     booking = payload.get("booking") or payload
@@ -556,13 +616,6 @@ def webhook_lodgify():
 
 @app.get("/lodgify-sync-all")
 def lodgify_sync_all():
-    """
-    Full sync page-by-page. Params:
-      - limit (default 50): Lodgify მაინც აბრუნებს 25-ზე გვერდს
-      - skip  (default 0)
-      - max_sec (default 20): დროის ლიმიტი worker timeout-ის ასარიდებლად
-      - debug=1 -> დააბრუნებს sample_input/mapped
-    """
     limit = int(request.args.get("limit", 50))
     skip = int(request.args.get("skip", 0))
     debug = request.args.get("debug", "0") == "1"
@@ -571,7 +624,6 @@ def lodgify_sync_all():
     started = datetime.now(timezone.utc)
     processed = 0
     results = []
-    errors = []
 
     bookings = lodgify.list_bookings(limit=limit, skip=skip)
 
@@ -584,11 +636,8 @@ def lodgify_sync_all():
         except Exception as e:
             log.exception("Upsert failed for booking id=%s", bk.get("id"))
             results.append({"ok": False, "error": str(e), "source_id": bk.get("id")})
-            errors.append(str(e))
 
-        # time budget
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-        if elapsed > max_sec:
+        if (datetime.now(timezone.utc) - started).total_seconds() > max_sec:
             break
 
     next_skip = skip + processed if processed > 0 else skip
