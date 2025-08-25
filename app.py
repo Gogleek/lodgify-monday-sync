@@ -1,7 +1,7 @@
-import os, json, logging, re, requests, time
+import os, json, logging, re, requests, uuid, time
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone, date, timedelta
 from flask import Flask, request, jsonify
 
@@ -14,10 +14,16 @@ handler = RotatingFileHandler("app.log", maxBytes=1_000_000, backupCount=3)
 logging.basicConfig(level=level, handlers=[handler, logging.StreamHandler()])
 log = logging.getLogger("lodgify-monday")
 
-# default timeout wrapper (ერთ ადგილზე)
+# Instrument requests a bit for troubleshooting
 _original_request = requests.Session.request
 def _request(self, method, url, **kwargs):
-    kwargs.setdefault("timeout", 45)
+    tag = None
+    if "lodgify.com" in (url or ""):
+        tag = f"Lodgify {uuid.uuid4().hex[:10]}"
+    elif "monday.com" in (url or ""):
+        tag = f"Monday {uuid.uuid4().hex[:10]}"
+    if tag:
+        log.info("[%s] %s %s params=%s", tag, method.upper(), url, kwargs.get("params"))
     return _original_request(self, method, url, **kwargs)
 requests.Session.request = _request
 
@@ -25,6 +31,7 @@ requests.Session.request = _request
 # Helpers
 # -----------------------
 E164_RE = re.compile(r"^\+?[1-9]\d{6,14}$")
+PAREN_RE = re.compile(r"\(([^)]+)\)")
 
 def normalize_phone(raw: str) -> str:
     if not raw:
@@ -40,7 +47,7 @@ def normalize_phone(raw: str) -> str:
     return digits[-12:] if digits else ""
 
 def iso_date(v) -> Optional[str]:
-    if not v:
+    if v is None or v == "":
         return None
     if isinstance(v, dict):
         v = v.get("time") or v.get("date") or None
@@ -55,36 +62,31 @@ def iso_date(v) -> Optional[str]:
         except Exception:
             return None
 
+def parse_date(s: Optional[str]):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
 def safe_float(x, default=0.0):
     try:
         return float(x)
     except Exception:
         return float(default)
 
-def days_between(a: Optional[str], b: Optional[str]) -> Optional[int]:
-    if not a or not b:
-        return None
-    try:
-        da = datetime.strptime(a, "%Y-%m-%d").date()
-        db = datetime.strptime(b, "%Y-%m-%d").date()
-        return (db - da).days
-    except Exception:
-        return None
-
 def today_iso():
     return datetime.now(timezone.utc).date().isoformat()
 
-def calc_stay_phase(check_in: Optional[str], check_out: Optional[str]) -> Optional[str]:
-    if not check_in or not check_out:
+def days_between(a: Optional[str], b: Optional[str]) -> Optional[int]:
+    da = parse_date(a); db = parse_date(b)
+    if not da or not db:
         return None
-    t = datetime.now(timezone.utc).date()
-    ci = datetime.strptime(check_in, "%Y-%m-%d").date()
-    co = datetime.strptime(check_out, "%Y-%m-%d").date()
-    if t < ci:
-        return "Upcoming"
-    if ci <= t < co:
-        return "In house"
-    return "Completed"
+    return (db - da).days
+
+def _norm(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
 
 # -----------------------
 # COLUMN MAP ( შენი IDs )
@@ -100,7 +102,7 @@ COLUMN_MAP = {
     "check_out":      "date_mkv46w1t",     # Check-out (Date)
     "nights":         "numeric_mkv4j5aq",  # Nights (Numbers)
     "source":         "dropdown_mkv47kzc", # Source (Dropdown)
-    "status":         "color_mkv4zrs6",    # Status (Status/color)
+    "status":         "color_mkv4zrs6",    # Booking Status (Status/color) - Confirmed/Paid/Pending/Cancelled
     "stay_status":    "color_mkv4v5f0",    # NEW: Upcoming / In house / Completed
     "last_sync":      "date_mkv44erw",     # Last Sync (Date)
     "raw_json":       "long_text_mkv4y19w",# Raw JSON (Long text)
@@ -123,7 +125,12 @@ COLUMN_MAP = {
     "canceled_at":    "date_mkv4hw1d",     # Canceled At (Date)
 }
 
-# Label maps
+# Allowed dropdown labels (fallbacks if env not set)
+DEFAULT_ALLOWED_SOURCE_LABELS = {"Booking.com", "Airbnb", "Expedia", "Vrbo", "Direct"}
+env_labels = {s.strip() for s in os.getenv("SOURCE_LABELS_ALLOWED", "").split(",") if s.strip()}
+ALLOWED_SOURCE_LABELS = env_labels or DEFAULT_ALLOWED_SOURCE_LABELS
+
+# Booking-status label map
 STATUS_LABELS = {
     "confirmed": "Confirmed",
     "booked":    "Confirmed",
@@ -134,19 +141,73 @@ STATUS_LABELS = {
 }
 STATUS_DEFAULT = "Pending"
 
-SOURCE_LABELS = {
-    # dropdown labels that რეალურად გაქვს ბორდზე
-    "booking.com": "Booking.com",
-    "airbnb":      "Airbnb",
-    "expedia":     "Expedia",
-    "vrbo":        "Vrbo",
-}
-# "manual" და სხვა აუცნობი არდავარდეს dropdown-ში — წავა source_text-ში
-
 def put(cv: dict, logical_key: str, value):
     col_id = COLUMN_MAP.get(logical_key)
     if col_id is not None and value is not None:
         cv[col_id] = value
+
+# -----------------------
+# Source mapping (robust)
+# -----------------------
+def label_for_source(raw_source: Optional[str], raw_source_text: Optional[str]) -> Optional[str]:
+    blob = f"{_norm(raw_source)} {_norm(raw_source_text)}"
+    if "booking.com" in blob or "booking com" in blob or "bookingcom" in blob:
+        return "Booking.com"
+    if "airbnb" in blob:
+        return "Airbnb"
+    if "expedia" in blob:
+        return "Expedia"
+    if "vrbo" in blob:
+        return "Vrbo"
+    if "direct" in blob:
+        return "Direct"
+    # არ ვაბრუნებთ "Manual"-ს — ბევრ ბორდზე ასეთი ლეიბლი საერთოდ არ არსებობს
+    return None
+
+# -----------------------
+# Unit extractor
+# -----------------------
+def extract_unit_name(bk: dict) -> Optional[str]:
+    # 1) rental.name
+    rental = bk.get("rental") or {}
+    name = (rental.get("name") or "").strip()
+    if name:
+        return name
+
+    # 2) unit_name (თუ გაქვს სხვა ინტეგრაციიდან)
+    if bk.get("unit_name"):
+        u = str(bk["unit_name"]).strip()
+        if u:
+            return u
+
+    # 3) source_text/source → ბოლო ფრჩხილები
+    st = (bk.get("source_text") or bk.get("source") or "").strip()
+    if st:
+        matches = PAREN_RE.findall(st)
+        if matches:
+            candidate = matches[-1].strip()
+            # იგნორირებულია სუფთა ციფრები/კოდები
+            if re.search(r"[A-Za-z]", candidate) and not re.fullmatch(r"\d{5,}", candidate):
+                return candidate
+
+        # 4) დეფისის მარჯვენა ნაწილი — ბოლო 2-3 სიტყვა
+        parts = [p.strip() for p in st.split("-") if p.strip()]
+        if len(parts) >= 2:
+            tail = parts[-1]
+            tokens = [t for t in re.split(r"\s+", tail) if re.search(r"[A-Za-z]", t)]
+            if tokens:
+                guess = " ".join(tokens[-3:]).strip()
+                if 2 <= len(guess) <= 40:
+                    return guess
+
+    # 5) rooms[0].key_code (ხშირად ცარიელია, მაგრამ ვცადოთ)
+    rooms = bk.get("rooms") or []
+    if rooms:
+        kc = (rooms[0].get("key_code") or "").strip()
+        if kc:
+            return kc
+
+    return None
 
 # -----------------------
 # Lodgify Client (v2)
@@ -165,16 +226,14 @@ class LodgifyClient:
     def list_bookings(self, limit: int = 50, skip: int = 0) -> List[dict]:
         url = f"{self.api_base}/v2/reservations/bookings"
         params = {"take": max(1, int(limit)), "skip": max(0, int(skip))}
-        log.info("[Lodgify] GET %s params=%s", url, params)
-        resp = self.session.get(url, params=params)
+        resp = self.session.get(url, params=params, timeout=45)
 
-        # fallback: page/pageSize სტილი
+        # fallback: page/pageSize style
         if resp.status_code in (400, 404):
             page_size = max(1, int(limit))
             page_number = max(1, (int(skip) // page_size) + 1)
             params = {"pageSize": page_size, "pageNumber": page_number}
-            log.info("[Lodgify] fallback GET %s params=%s", url, params)
-            resp = self.session.get(url, params=params)
+            resp = self.session.get(url, params=params, timeout=45)
 
         if not resp.ok:
             raise RuntimeError(f"Lodgify error {resp.status_code}: {resp.text[:500]}")
@@ -185,7 +244,7 @@ class LodgifyClient:
             items = list(items.values())
         if not isinstance(items, list):
             items = []
-        log.info("[Lodgify] fetched %d item(s) (limit=%s, skip=%s)", len(items), limit, skip)
+        log.info("Lodgify fetched %d item(s) (limit=%s, skip=%s)", len(items), limit, skip)
         return items
 
 # -----------------------
@@ -216,7 +275,7 @@ class MondayClient:
         payload = {"query": query}
         if variables:
             payload["variables"] = variables
-        r = self.session.post(self.api_base, data=json.dumps(payload))
+        r = self.session.post(self.api_base, data=json.dumps(payload), timeout=45)
         if r.status_code != 200:
             raise RuntimeError(f"Monday HTTP {r.status_code}: {r.text[:500]}")
         out = r.json()
@@ -224,13 +283,14 @@ class MondayClient:
             raise RuntimeError(f"Monday GQL error: {out['errors']}")
         return out.get("data", {})
 
-    def find_item_by_external_id(self, column_id: str, external_id: str) -> Optional[dict]:
+    def find_item_by_external_id(self, column_id: str, external_id: str) -> Optional[Tuple[int, str]]:
+        # ვცდილობთ active + archived
         query = """
         query($board_id: ID!, $column_id: String!, $value: String!) {
           items_page_by_column_values(
             board_id: $board_id,
             columns: [{column_id: $column_id, column_values: [$value]}],
-            limit: 1
+            limit: 2
           ) { items { id state } }
         }
         """
@@ -238,8 +298,14 @@ class MondayClient:
         items = (((data or {}).get("items_page_by_column_values") or {}).get("items")) or []
         if not items:
             return None
-        it = items[0]
-        return {"id": int(it["id"]), "state": it.get("state") or "active"}
+        # პრიორიტეტი active→archived
+        active = [it for it in items if (it.get("state") or "").lower() == "active"]
+        first = (active or items)[0]
+        return (int(first["id"]), str(first.get("state") or "active"))
+
+    def restore_item(self, item_id: int):
+        query = "mutation($item_id: ID!) { restore_item(item_id: $item_id) { id } }"
+        self._gql(query, {"item_id": str(item_id)})
 
     def create_item(self, item_name: str, column_values: Dict[str, object]) -> int:
         query = """
@@ -247,7 +313,7 @@ class MondayClient:
           create_item(board_id: $board_id, item_name: $name, column_values: $cols) { id }
         }
         """
-        data = self._gql(query, {"board_id": str(self.board_id), "name": item_name, "cols": json.dumps(column_values)})
+        data = self._gql(query, {"board_id": str(self.board_id), "name": item_name, "cols": json.dumps(column_values, ensure_ascii=False)})
         return int(data["create_item"]["id"])
 
     def update_item(self, item_id: int, column_values: Dict[str, object]) -> int:
@@ -256,118 +322,82 @@ class MondayClient:
           change_multiple_column_values(item_id: $item_id, board_id: $board_id, column_values: $cols) { id }
         }
         """
-        data = self._gql(query, {"board_id": str(self.board_id), "item_id": str(item_id), "cols": json.dumps(column_values)})
+        data = self._gql(query, {"board_id": str(self.board_id), "item_id": str(item_id), "cols": json.dumps(column_values, ensure_ascii=False)})
         return int(data["change_multiple_column_values"]["id"])
 
-    def restore_item(self, item_id: int) -> bool:
-        query = """mutation($item_id: ID!) { restore_item(item_id: $item_id) { id } }"""
-        try:
-            self._gql(query, {"item_id": str(item_id)})
-            return True
-        except Exception as e:
-            log.warning("Restore failed for item %s: %s", item_id, e)
-            return False
+    def map_reservation_ids(self, page_limit: int = 200) -> tuple[int, Dict[str, List[int]]]:
+        """დაასკანერე ბორდის ყველა აითემი და ააგროვე reservation_id => [item_ids]"""
+        col_id = COLUMN_MAP["reservation_id"]
 
-    def upsert_item(self, mapped: dict) -> UpsertResult:
-        item_name = mapped["item_name"]
-        external_id = mapped["external_id"]
-        column_values = mapped["column_values"]
+        q_first = """
+        query($board_id: ID!, $limit: Int!, $col_ids: [String!]) {
+          items_page(board_id: $board_id, limit: $limit) {
+            cursor
+            items { id state column_values(ids: $col_ids) { id text } }
+          }
+        }"""
 
-        lookup_col = COLUMN_MAP["reservation_id"]
-        try:
-            existing_meta = None
-            try:
-                existing_meta = self.find_item_by_external_id(lookup_col, external_id)
-            except Exception as inner_e:
-                if "Column not found" in str(inner_e) or "missing_column" in str(inner_e):
-                    log.warning("Lookup column '%s' not found on board %s. Creating without lookup.", lookup_col, self.board_id)
-                else:
-                    raise
+        q_next = """
+        query($cursor: String!, $col_ids: [String!]) {
+          next_items_page(cursor: $cursor) {
+            cursor
+            items { id state column_values(ids: $col_ids) { id text } }
+          }
+        }"""
 
-            if existing_meta:
-                item_id = existing_meta["id"]
-                state = (existing_meta.get("state") or "active").lower()
+        res_map: Dict[str, List[int]] = {}
+        total = 0
 
-                if state == "active":
-                    self.update_item(item_id, column_values)
-                    log.info("Updated Monday item id=%s (ext=%s)", item_id, external_id)
-                    return UpsertResult(ok=True, item_id=item_id, created=False, updated=True)
+        data = self._gql(q_first, {"board_id": str(self.board_id), "limit": page_limit, "col_ids": [col_id]})
+        page = (data or {}).get("items_page") or {}
+        while True:
+            items = page.get("items") or []
+            for it in items:
+                total += 1
+                if (it.get("state") or "").lower() == "deleted":
+                    continue
+                rid = None
+                for cv in (it.get("column_values") or []):
+                    if cv.get("id") == col_id:
+                        rid = (cv.get("text") or "").strip()
+                        break
+                if rid:
+                    res_map.setdefault(rid, []).append(int(it["id"]))
 
-                if state == "archived":
-                    if self.restore_item(item_id):
-                        self.update_item(item_id, column_values)
-                        log.info("Restored & updated item id=%s (ext=%s)", item_id, external_id)
-                        return UpsertResult(ok=True, item_id=item_id, created=False, updated=True)
-                    else:
-                        safe_name = f"{item_name} • #{external_id}"
-                        new_id = self.create_item(safe_name, column_values)
-                        log.info("Created NEW (restore failed) id=%s (ext=%s)", new_id, external_id)
-                        return UpsertResult(ok=True, item_id=new_id, created=True, updated=False)
+            cursor = page.get("cursor")
+            if not cursor:
+                break
+            data = self._gql(q_next, {"cursor": cursor, "col_ids": [col_id]})
+            page = (data or {}).get("next_items_page") or {}
 
-                if state == "deleted":
-                    safe_name = f"{item_name} • #{external_id}"
-                    new_id = self.create_item(safe_name, column_values)
-                    log.info("Created NEW (was deleted) id=%s (ext=%s)", new_id, external_id)
-                    return UpsertResult(ok=True, item_id=new_id, created=True, updated=False)
-
-                safe_name = f"{item_name} • #{external_id}"
-                new_id = self.create_item(safe_name, column_values)
-                log.info("Created NEW (unknown state=%s) id=%s (ext=%s)", state, new_id, external_id)
-                return UpsertResult(ok=True, item_id=new_id, created=True, updated=False)
-
-            # საერთოდ ვერ ვიპოვეთ — შექმენი
-            safe_name = f"{item_name} • #{external_id}"
-            new_id = self.create_item(safe_name, column_values)
-            log.info("Created Monday item id=%s (ext=%s)", new_id, external_id)
-            return UpsertResult(ok=True, item_id=new_id, created=True, updated=False)
-
-        except Exception as e:
-            log.exception("Upsert failed for external_id=%s", external_id)
-            return UpsertResult(ok=False, error=str(e))
+        return total, res_map
 
 # -----------------------
 # Mapping Lodgify → Monday
 # -----------------------
-UNIT_IN_PARENS_RE = re.compile(r"\(([^()]{1,60})\)\s*$")
-GENERIC_UNIT_RE = re.compile(r"\b(Queen'?s\s+\d+|Samui\s+\d+\/\d+|B\d+|Cornwall|Rutland)\b", re.IGNORECASE)
-
-def guess_unit_name(bk: dict) -> Optional[str]:
-    # 1) explicit fields
-    unit_name = (bk.get("rental") or {}).get("name") or bk.get("unit_name")
-    if unit_name and isinstance(unit_name, str) and unit_name.strip().lower() not in {"null", "none", "false"}:
-        return unit_name.strip()
-
-    # 2) source_text ბოლოში (Queens 8)
-    st = (bk.get("source_text") or "").strip()
-    if st:
-        m = UNIT_IN_PARENS_RE.search(st)
-        if m:
-            return m.group(1).strip()
-        m2 = GENERIC_UNIT_RE.search(st)
-        if m2:
-            return m2.group(0).strip()
-
-    # 3) არაფერია — Unknown unit
-    return "Unknown unit"
-
 def label_for_status(raw: str) -> str:
     key = (raw or "").lower().strip()
     return STATUS_LABELS.get(key, STATUS_DEFAULT)
 
-def label_for_source(raw: Optional[str]) -> Optional[str]:
-    if not raw:
+def compute_stay_status_label(check_in: Optional[str], check_out: Optional[str]) -> Optional[str]:
+    """Upcoming (future), In house (today within stay), Completed (past)."""
+    today = parse_date(today_iso())
+    ci = parse_date(check_in); co = parse_date(check_out)
+    if not ci or not co or not today:
         return None
-    r = raw.lower()
-    for k, v in SOURCE_LABELS.items():
-        if k in r:
-            return v
-    return None  # აუცნობი — dropdown არ შევავსოთ
+    if today < ci:
+        return "Upcoming"
+    if ci <= today < co:
+        return "In house"
+    return "Completed"
 
 def map_booking_to_monday(bk: dict) -> dict:
     # identifiers & meta
-    res_id = str(bk.get("id") or bk.get("booking_id") or bk.get("code") or "")
+    res_id = str(bk.get("id") or bk.get("booking_id") or bk.get("code") or "").strip()
     property_id = bk.get("property_id") or (bk.get("rental") or {}).get("id")
-    unit_name = guess_unit_name(bk)
+    if isinstance(property_id, bool):
+        property_id = None
+    unit_name = extract_unit_name(bk) or "Unknown unit"
 
     # guest
     guest = bk.get("guest") or {}
@@ -381,14 +411,13 @@ def map_booking_to_monday(bk: dict) -> dict:
         else:
             first_name = " ".join(parts[:-1]); last_name = parts[-1]
     display_name = (f"{first_name} {last_name}".strip() or full_name) or f"Booking {res_id}"
-    email = (guest.get("email") or "") or None
+    email = (guest.get("email") or "").strip() or None
     phone = normalize_phone(guest.get("phone") or guest.get("mobile") or "")
 
     # dates
     check_in = iso_date(bk.get("arrival") or bk.get("check_in"))
     check_out = iso_date(bk.get("departure") or bk.get("check_out"))
     nights = days_between(check_in, check_out)
-    stay_phase = calc_stay_phase(check_in, check_out)
 
     # money
     total_amount = safe_float(bk.get("total_amount") or bk.get("total") or bk.get("price_total"))
@@ -399,9 +428,9 @@ def map_booking_to_monday(bk: dict) -> dict:
     # status / source
     status_raw = bk.get("status") or ""
     status_label = label_for_status(status_raw)
-    source_text = (bk.get("source_text") or "").strip()
-    source_raw  = (bk.get("source") or "") + (" " + source_text if source_text else "")
-    source_label = label_for_source(source_raw)
+    source_text = bk.get("source_text") or ""
+    source_raw  = (bk.get("source") or "")
+    source_label = label_for_source(source_raw, source_text)
 
     # rooms / people breakdown (best effort)
     people = None; adults = children = infants = pets = None; key_code = None
@@ -427,26 +456,30 @@ def map_booking_to_monday(bk: dict) -> dict:
     put(cv, "unit", unit_name)
     put(cv, "property_id", str(property_id) if property_id else None)
     put(cv, "guest_name", display_name)
-
-    # Email/Phone — სწორი სტრუქტურით
+    # Email column strict: value must be {"email": "...", "text": "..."}; text never None
     if email:
-        put(cv, "email", {"email": email, "text": email})
-    if phone:
-        put(cv, "phone", {"phone": phone})
+        put(cv, "email", {"email": email, "text": display_name or email})
+    # Phone – მარტივად ჩავწეროთ ტექსტად (შენს ბორდს ასე ეჭირა OK)
+    put(cv, "phone", phone or None)
 
     put(cv, "check_in", {"date": check_in})
     put(cv, "check_out", {"date": check_out})
     put(cv, "nights", nights)
 
-    if source_label:
+    # Source dropdown – ვწერთ მხოლოდ თუ ლეიბლი ნებადართულია, თორემ ვაგდებთ source_text-ში
+    if source_label and source_label in ALLOWED_SOURCE_LABELS:
         put(cv, "source", {"labels": [source_label]})  # dropdown
     else:
-        put(cv, "source_text", source_raw.strip() or None)
+        # fallback – შევინახოთ სრული ტექსტი long_text-ში
+        st_blob = (source_raw + (" " + source_text if source_text else "")).strip()
+        put(cv, "source_text", st_blob or None)
 
-    put(cv, "status", {"label": status_label})         # status/color
-    if stay_phase:
-        put(cv, "stay_status", {"label": stay_phase})  # NEW stay status
+    put(cv, "status", {"label": status_label})         # booking status/color
     put(cv, "last_sync", {"date": today_iso()})
+    # Stay status (Upcoming / In house / Completed)
+    stay_label = compute_stay_status_label(check_in, check_out)
+    if stay_label:
+        put(cv, "stay_status", {"label": stay_label})
 
     put(cv, "currency", currency)
     put(cv, "total", total_amount)
@@ -500,18 +533,37 @@ def _unhandled(e):
 
 @app.get("/health")
 def health():
-    ready = bool(LODGY_API_KEY and MONDAY_API_KEY and MONDAY_BOARD_ID)
     env = {
         "LODGY_API_BASE": LODGY_API_BASE,
         "LODGY_API_KEY_set": bool(LODGY_API_KEY),
         "MONDAY_API_BASE": MONDAY_API_BASE,
         "MONDAY_API_KEY_set": bool(MONDAY_API_KEY),
     }
-    return jsonify({"ok": True, "service": "lodgify-monday", "board_id": MONDAY_BOARD_ID, "ready": ready, "env": env}), 200
+    ready = bool(LODGY_API_KEY and MONDAY_API_KEY and MONDAY_BOARD_ID)
+    return jsonify({"ok": True, "service": "lodgify-monday", "board_id": MONDAY_BOARD_ID, "env": env, "ready": ready}), 200
 
 @app.get("/")
 def root():
-    return jsonify({"ok": True, "endpoints": ["/health", "/lodgify-sync-all", "/webhook/lodgify", "/diag/monday-columns", "/diag/ping-lodgify", "/diag/ping-monday"]}), 200
+    return jsonify({"ok": True, "endpoints": [
+        "/health",
+        "/diag/ping-lodgify",
+        "/diag/ping-monday",
+        "/diag/monday-columns",
+        "/diag/monday-unique-bookings",
+        "/diag/lodgify-count",
+        "/lodgify-sync-all"
+    ]}), 200
+
+@app.get("/diag/ping-lodgify")
+def diag_ping_lodgify():
+    items = lodgify.list_bookings(limit=1, skip=0)
+    return jsonify({"ok": True, "count": len(items)}), 200
+
+@app.get("/diag/ping-monday")
+def diag_ping_monday():
+    q = "query { me { id name } }"
+    data = monday._gql(q, {})
+    return jsonify({"ok": True, "me": (data or {}).get("me")}), 200
 
 @app.get("/diag/monday-columns")
 def diag_monday_columns():
@@ -533,21 +585,59 @@ def diag_monday_columns():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.get("/diag/ping-lodgify")
-def ping_lodgify():
+@app.get("/diag/monday-unique-bookings")
+def diag_monday_unique_bookings():
     try:
-        lodgify.list_bookings(limit=1, skip=0)
-        return jsonify({"ok": True}), 200
+        total, res_map = monday.map_reservation_ids(page_limit=200)
+        unique_cnt = len(res_map)
+        dups = {rid: ids for rid, ids in res_map.items() if len(ids) > 1}
+        return jsonify({
+            "ok": True,
+            "board_id": MONDAY_BOARD_ID,
+            "scanned_items": total,
+            "unique_reservations": unique_cnt,
+            "duplicate_count": len(dups),
+            "duplicates": [{"reservation_id": k, "item_ids": v} for k, v in dups.items()]
+        }), 200
     except Exception as e:
+        log.exception("diag_monday_unique_bookings failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.get("/diag/ping-monday")
-def ping_monday():
+@app.get("/diag/lodgify-count")
+def diag_lodgify_count():
+    """Lodgify-ის უნიკალური ბუქინგების რაოდენობა (პაგინაციით). პარამეტრები: take, max_pages."""
     try:
-        q = "query { me { id name } }"
-        data = monday._gql(q, {})
-        return jsonify({"ok": True, "me": data.get("me")}), 200
+        take = int(request.args.get("take", 50))
+        max_pages = int(request.args.get("max_pages", 200))
+        seen = set()
+        skip = 0
+        pages = 0
+        total_seen = 0
+
+        while pages < max_pages:
+            items = lodgify.list_bookings(limit=take, skip=skip)
+            if not items:
+                break
+            for bk in items:
+                rid = str(bk.get("id") or bk.get("booking_id") or bk.get("code") or "").strip()
+                if rid:
+                    seen.add(rid)
+                total_seen += 1
+            # პრაქტიკაში Lodgify 25-ს აბრუნებს გვერდზე
+            if len(items) < 1:
+                break
+            skip += len(items)
+            pages += 1
+
+        return jsonify({
+            "ok": True,
+            "pages_scanned": pages,
+            "total_records_seen": total_seen,
+            "unique_reservations": len(seen),
+            "next_skip_hint": skip
+        }), 200
     except Exception as e:
+        log.exception("diag_lodgify_count failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/webhook/lodgify")
@@ -561,37 +651,71 @@ def webhook_lodgify():
     res: UpsertResult = monday.upsert_item(mapped)
     return jsonify({"ok": True, "result": res.to_dict(), "source": "webhook"}), 200
 
+# ---- upsert core ----
+def _safe_upsert(mapped: dict) -> UpsertResult:
+    item_name = mapped["item_name"]
+    external_id = mapped["external_id"]
+    column_values = mapped["column_values"]
+
+    lookup_col = COLUMN_MAP["reservation_id"]
+    try:
+        found = monday.find_item_by_external_id(lookup_col, external_id)
+        if found:
+            item_id, state = found
+            # თუ archived/ასევე active, ერთხელ ვცადოთ restore, მერე update
+            if (state or "").lower() == "archived":
+                try:
+                    monday.restore_item(item_id)
+                    log.info("Restored archived item id=%s (ext=%s)", item_id, external_id)
+                except Exception as rexc:
+                    log.warning("Restore failed id=%s: %s", item_id, rexc)
+            monday.update_item(item_id, column_values)
+            log.info("Updated Monday item id=%s (ext=%s)", item_id, external_id)
+            return UpsertResult(ok=True, item_id=item_id, created=False, updated=True)
+        else:
+            safe_name = f"{item_name} • #{external_id}"
+            new_id = monday.create_item(safe_name, column_values)
+            log.info("Created Monday item id=%s (ext=%s)", new_id, external_id)
+            return UpsertResult(ok=True, item_id=new_id, created=True, updated=False)
+    except Exception as e:
+        log.exception("Upsert failed for external_id=%s", external_id)
+        return UpsertResult(ok=False, error=str(e))
+
+MondayClient.upsert_item = staticmethod(_safe_upsert)  # monkey-attach
+
 @app.get("/lodgify-sync-all")
 def lodgify_sync_all():
     limit = int(request.args.get("limit", 50))
     skip = int(request.args.get("skip", 0))
     debug = request.args.get("debug", "0") == "1"
-    max_sec = int(request.args.get("max_sec", 20))  # prevent gunicorn timeout
-    t0 = time.time()
+    max_sec = float(request.args.get("max_sec", 24))  # ~gunicorn 30sამდე
 
+    t0 = time.time()
     bookings = lodgify.list_bookings(limit=limit, skip=skip)
     results = []
     processed = 0
-    next_skip = skip
-
     for bk in bookings:
-        if time.time() - t0 > max_sec:
-            break
         try:
             mapped = map_booking_to_monday(bk)
-            res: UpsertResult = monday.upsert_item(mapped)
+            res: UpsertResult = _safe_upsert(mapped)
             results.append(res.to_dict())
             processed += 1
-            next_skip += 1
         except Exception as e:
             log.exception("Upsert failed for booking id=%s", bk.get("id"))
             results.append({"ok": False, "error": str(e), "source_id": bk.get("id")})
+        if (time.time() - t0) > max_sec:
+            log.warning("Cut by max_sec=%.1f after processed=%d", max_sec, processed)
+            break
 
-    resp = {"ok": True, "count": len(results), "processed": processed, "next_skip": next_skip}
+    resp = {
+        "ok": True,
+        "count": len(results),
+        "processed": processed,
+        "next_skip": skip + processed
+    }
     if debug and bookings:
         resp["sample_input"] = bookings[:1]
         resp["sample_mapped"] = map_booking_to_monday(bookings[0])
-    resp["results"] = results
     return jsonify(resp), 200
 
 if __name__ == "__main__":
